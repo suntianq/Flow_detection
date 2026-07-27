@@ -1,0 +1,74 @@
+dataset:
+  dir: flow_dataset
+
+model:
+  # choices: cnn_lstm, lstm, gru, tcn, transformer
+  name: cnn_lstm
+  max_seq_len: 64
+  function_emb_dim: 48
+  offset_emb_dim: 32
+  node_emb_dim: 64
+  ctrl_type_emb_dim: 8
+  icount_emb_dim: 8
+  model_dim: 128
+  conv_blocks: 2
+  conv_filters: 128
+  conv_kernel: 5
+  pool_size: 2
+  lstm_units: [128, 64]
+  gru_units: [128, 64]
+  tcn_filters: 128
+  tcn_kernel: 5
+  tcn_dilations: [1, 2, 4, 8]
+  transformer_layers: 2
+  transformer_heads: 4
+  transformer_ff_dim: 256
+  dropout: 0.3
+
+training:
+  batch_size: 128
+  epochs: 20
+  validation_split: 0.1
+  learning_rate: 0.001
+  seed: 1234
+  mixed_precision: false
+  output_model: flow_model/flow_cnn_lstm.keras
+  patience: 5
+  lr_patience: 3
+
+compress:
+  input_model: flow_model/flow_cnn_lstm.keras
+  output_model: flow_model/flow_cnn_lstm_pruned.keras
+  output_tflite: flow_model/flow_cnn_lstm_pruned_int8.tflite
+  batch_size: 128
+  epochs: 5
+  recovery_epochs: 1
+  learning_rate: 0.0001
+  initial_sparsity: 0.2
+  final_sparsity: 0.7
+  pruning_updates: 20
+  exclude_patterns: [bias, beta, gamma, position_embedding]
+  quantization: int8
+  representative_samples: 512
+  integer_only: false
+  allow_select_tf_ops: false
+
+loss_weights:
+  dst_node: 1.0
+  ctrl_type: 0.2
+
+predict:
+  dataset_dir: flow_dataset
+  model: flow_model/flow_cnn_lstm.keras
+  max_seq_len: 64
+  batch_size: 128
+  output: prediction_report.jsonl
+  prob_threshold: 0.1
+  window_size: 64
+  window_low_threshold: 5
+  score_mode: dst
+  ctrl_weight: 0.2
+  partial_window: false
+  write_all_scores: false
+  limit: 0
+  show_progress: true
