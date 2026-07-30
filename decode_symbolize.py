@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import argparse
-import concurrent.futures
 import bisect
+import concurrent.futures
+import contextlib
+import io
 import json
 import os
 import re
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -1738,7 +1741,9 @@ class InstructionFollower:
 
     def _decoder_for(self, module: ModuleRule) -> AArch64InstructionDecoder:
         assert module.image is not None
-        key = (module.elf_path.resolve(), module.image.little_endian)
+        # module.image.path 已在 ElfImage.__init__ 中 resolve() 过；复用它可避免
+        # 在逐指令热路径上对每条指令都跑一次 Path.resolve() 的文件系统 syscall。
+        key = (module.image.path, module.image.little_endian)
         decoder = self._decoders.get(key)
         if decoder is None:
             decoder = AArch64InstructionDecoder(module.image.little_endian)
@@ -2599,6 +2604,37 @@ def process_trace(
             or line_value.startswith("TraceOn")
         )
 
+    def starts_new_packet(line_value: str) -> bool:
+        """判断某行是否是一个新数据包的开头。
+
+        用于在 TraceInfo 字段跨行累积时提供一个可靠的终止条件：只有当后续行
+        确实像 TraceInfo 的 key=value 续行时才继续累积，一旦遇到任何已知数据包
+        的起始行就立即收尾。避免在 TraceInfo 缺少 cc_threshold 时把后续整段
+        trace 静默吞入 trace_info_parts。
+        """
+        if (
+            line_value.startswith("Decode trace stream")
+            or line_value.startswith("TraceInfo")
+            or line_value.startswith("Address ")
+            or line_value.startswith("Timestamp")
+            or line_value.startswith("ATOM")
+            or line_value.startswith("Commit")
+            or line_value.startswith("Cancel")
+            or line_value.startswith("Exception")
+            or line_value.startswith("TraceOn")
+            or line_value.startswith("Discard")
+            or line_value.startswith("Conditional flush")
+        ):
+            return True
+        return (
+            "Context ID" in line_value
+            or "VMID" in line_value
+            or "Exception level" in line_value
+            or "Security" in line_value
+            or "64-bit instruction" in line_value
+            or "32-bit instruction" in line_value
+        )
+
     def emit_trace_info_block() -> None:
         nonlocal trace_info_parts
         if trace_info_parts is None:
@@ -2623,7 +2659,9 @@ def process_trace(
         with trace_path.open("r", encoding="utf-8", errors="replace") as trace_stream:
             for raw_line in trace_stream:
                 stats["lines"] += 1
-                read_bytes += len(raw_line.encode("utf-8", errors="replace"))
+                # 进度只需近似量：trace 是 ASCII 文本反汇编，字符数≈字节数，
+                # 用 len(raw_line) 做廉价字节代理，避免每行都 encode 出一个临时 bytes。
+                read_bytes += len(raw_line)
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -2639,10 +2677,20 @@ def process_trace(
                     last_report = read_bytes
 
                 if trace_info_parts is not None:
-                    trace_info_parts.append(line)
                     if TRACE_INFO_END_RE.search(line):
+                        # 正常终止：cc_threshold 与其余字段在同一行或后续续行中出现。
+                        trace_info_parts.append(line)
                         emit_trace_info_block()
-                    continue
+                        continue
+                    if starts_new_packet(line):
+                        # 保护性终止：TraceInfo 缺少 cc_threshold（如关闭循环计数）时，
+                        # 遇到下一个数据包立即收尾，并让该行走正常解析流程，
+                        # 避免把后续 trace 静默吞入 trace_info_parts。
+                        emit_trace_info_block()
+                        # 不 continue，继续向下处理当前行。
+                    else:
+                        trace_info_parts.append(line)
+                        continue
 
                 if pending_resync_reasons and not is_resync_packet(line):
                     finish_resync()
@@ -3290,10 +3338,6 @@ def _discover_trace_files(
 
 def _run_batch_job(job: Dict[str, Any]) -> Dict[str, Any]:
     """进程池 worker。参数必须保持可 pickle。"""
-    import contextlib
-    import io
-    import traceback
-
     started = time.perf_counter()
     trace_path = Path(job["trace_path"])
     output_path = Path(job["output_path"])
@@ -3634,8 +3678,6 @@ def main() -> int:
         print("\n[ERROR] 用户中断", file=sys.stderr)
         return 130
     except Exception as exc:
-        import traceback
-
         print(f"[ERROR] {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 1

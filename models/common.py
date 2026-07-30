@@ -16,6 +16,9 @@ from dataset_builder import INPUT_FIELDS
 class LearnedPositionEmbedding(Layer):
     def __init__(self, max_len: int, embed_dim: int, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        # 加位置向量是逐元素操作，保持时间维 mask 不变；声明支持 mask 后
+        # lstm/gru 的 mask_zero 才能把 padding 掩码透传到下游 RNN。
+        self.supports_masking = True
         self.max_len = max_len
         self.embed_dim = embed_dim
         self.position_embedding = self.add_weight(
@@ -58,7 +61,17 @@ def parse_units(value: Any, default: List[int]) -> List[int]:
     return default
 
 
-def build_token_encoder(cfg: Any, vocab_sizes: Dict[str, int]) -> Tuple[Dict[str, Any], Any, Dict[str, int]]:
+def build_token_encoder(
+    cfg: Any,
+    vocab_sizes: Dict[str, int],
+    *,
+    mask_zero: bool = False,
+) -> Tuple[Dict[str, Any], Any, Dict[str, int]]:
+    """构建各字段嵌入并拼接投影。
+
+    mask_zero 仅对能正确传播 mask 的循环模型（lstm/gru）启用；卷积类模型
+    （cnn_lstm/tcn）和 transformer 的下游层对 mask 传播支持不一致，保持关闭。
+    """
     max_seq_len = int(cfg_value(cfg, "max_seq_len", 64))
     model_dim = int(cfg_value(cfg, "model_dim", 128))
 
@@ -77,26 +90,31 @@ def build_token_encoder(cfg: Any, vocab_sizes: Dict[str, int]) -> Tuple[Dict[str
     function_embedding = Embedding(
         input_dim=sizes["function"],
         output_dim=int(cfg_value(cfg, "function_emb_dim", 48)),
+        mask_zero=mask_zero,
         name="function_embedding",
     )
     offset_embedding = Embedding(
         input_dim=sizes["offset"],
         output_dim=int(cfg_value(cfg, "offset_emb_dim", 32)),
+        mask_zero=mask_zero,
         name="offset_embedding",
     )
     node_embedding = Embedding(
         input_dim=sizes["node"],
         output_dim=int(cfg_value(cfg, "node_emb_dim", 64)),
+        mask_zero=mask_zero,
         name="node_embedding",
     )
     ctrl_type_embedding = Embedding(
         input_dim=sizes["ctrl_type"],
         output_dim=int(cfg_value(cfg, "ctrl_type_emb_dim", 8)),
+        mask_zero=mask_zero,
         name="ctrl_type_embedding",
     )
     icount_embedding = Embedding(
         input_dim=sizes["icount"],
         output_dim=int(cfg_value(cfg, "icount_emb_dim", 8)),
+        mask_zero=mask_zero,
         name="icount_embedding",
     )
 

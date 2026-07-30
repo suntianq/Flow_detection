@@ -9,10 +9,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Sequence
 
+import tensorflow as tf
+import yaml
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.mixed_precision import set_global_policy
+from tensorflow.keras.optimizers import Adam
+
+from dataset_builder import FlowSequence, load_vocab_sizes
+from models import build_model
+
 
 def configure_gpu_memory_growth() -> None:
-    import tensorflow as tf
-
     for gpu in tf.config.list_physical_devices("GPU"):
         tf.config.experimental.set_memory_growth(gpu, True)
 
@@ -25,8 +32,6 @@ def build_loss_weights(cfg: SimpleNamespace) -> Dict[str, float]:
 
 
 def compile_model(model: Any, cfg: SimpleNamespace, vocab_sizes: Dict[str, int]) -> None:
-    from tensorflow.keras.optimizers import Adam
-
     losses = {
         "next_dst_node": "sparse_categorical_crossentropy",
         "next_ctrl_type": "sparse_categorical_crossentropy",
@@ -44,8 +49,6 @@ def compile_model(model: Any, cfg: SimpleNamespace, vocab_sizes: Dict[str, int])
 
 
 def load_config(path: Path) -> SimpleNamespace:
-    import yaml
-
     with path.open("r", encoding="utf-8") as stream:
         cfg = yaml.safe_load(stream) or {}
     if not isinstance(cfg, dict):
@@ -68,12 +71,32 @@ def load_config(path: Path) -> SimpleNamespace:
 
 
 def validate_config(cfg: SimpleNamespace) -> None:
-    if int(cfg.max_seq_len) <= 0:
+    def required(name: str) -> Any:
+        if not hasattr(cfg, name):
+            raise ValueError(f"config is missing required field: {name}")
+        return getattr(cfg, name)
+
+    if int(required("max_seq_len")) <= 0:
         raise ValueError("max_seq_len must be > 0")
-    if int(cfg.batch_size) <= 0:
+    if int(required("batch_size")) <= 0:
         raise ValueError("batch_size must be > 0")
-    if not 0.0 <= float(cfg.validation_split) < 1.0:
+    if not 0.0 <= float(required("validation_split")) < 1.0:
         raise ValueError("validation_split must be in [0.0, 1.0)")
+    if int(required("epochs")) <= 0:
+        raise ValueError("epochs must be > 0")
+    if float(required("learning_rate")) <= 0:
+        raise ValueError("learning_rate must be > 0")
+    if int(required("seed")) < 0:
+        raise ValueError("seed must be >= 0")
+    if int(required("patience")) < 0:
+        raise ValueError("patience must be >= 0")
+    if int(required("lr_patience")) < 0:
+        raise ValueError("lr_patience must be >= 0")
+    float(required("loss_weight_dst_node"))
+    float(required("loss_weight_ctrl_type"))
+    required("model_name")
+    required("dataset_dir")
+    required("output_model")
 
 
 def write_training_config(cfg: SimpleNamespace, input_config_path: Path, vocab_sizes: Dict[str, int]) -> None:
@@ -102,20 +125,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         cfg = load_config(cli_args.config)
         validate_config(cfg)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, KeyError) as exc:
         parser.error(str(exc))
 
-    if cfg.mixed_precision:
-        from tensorflow.keras.mixed_precision import set_global_policy
-
+    if getattr(cfg, "mixed_precision", False):
         set_global_policy("mixed_float16")
         print("Mixed precision enabled: mixed_float16")
 
     configure_gpu_memory_growth()
-
-    from dataset_builder import FlowSequence, load_vocab_sizes
-    from models import build_model
-    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
     dataset_dir = cfg.dataset_dir.expanduser().resolve()
     vocab_sizes = load_vocab_sizes(dataset_dir)

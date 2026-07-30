@@ -11,7 +11,7 @@ from .common import build_token_encoder, cfg_value, parse_units, prediction_head
 
 
 def build_lstm_model(cfg: Any, vocab_sizes: Dict[str, int]) -> Model:
-    inputs, x, sizes = build_token_encoder(cfg, vocab_sizes)
+    inputs, x, sizes = build_token_encoder(cfg, vocab_sizes, mask_zero=True)
     dropout = float(cfg_value(cfg, "dropout", 0.3))
     units_list = parse_units(cfg_value(cfg, "lstm_units", None), [128, 64])
 

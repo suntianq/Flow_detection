@@ -18,9 +18,7 @@ mapping and differences used for the report.
 
 from __future__ import print_function
 
-import csv
 import hashlib
-import json
 import os
 import re
 import sys
@@ -46,6 +44,43 @@ except ImportError:
 WL_MAX_ROUNDS = 8
 
 
+# ghidra_common lives next to this script; when run as a Ghidra postScript the
+# script directory is not always on sys.path.  The module imports nothing from
+# ghidra.*, so it stays importable for unit tests outside Ghidra as well.
+try:
+    from ghidra_common import (
+        address_text,
+        atomic_write_csv,
+        atomic_write_json,
+        collect_block_instructions,
+        flow_properties,
+        get_block_start,
+        get_script_arguments,
+        java_iter,
+        method_bool,
+        safe_call,
+    )
+except ImportError:
+    try:
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        _script_dir = os.getcwd()
+    if _script_dir not in sys.path:
+        sys.path.insert(0, _script_dir)
+    from ghidra_common import (
+        address_text,
+        atomic_write_csv,
+        atomic_write_json,
+        collect_block_instructions,
+        flow_properties,
+        get_block_start,
+        get_script_arguments,
+        java_iter,
+        method_bool,
+        safe_call,
+    )
+
+
 if GHIDRA_AVAILABLE:
     try:
         SCRIPT_MONITOR = monitor
@@ -64,35 +99,6 @@ def log(message):
     print(message)
 
 
-def safe_call(obj, method_name, default=None):
-    if obj is None:
-        return default
-    try:
-        return getattr(obj, method_name)()
-    except Exception:
-        return default
-
-
-def method_bool(obj, method_name):
-    try:
-        return bool(getattr(obj, method_name)())
-    except Exception:
-        return False
-
-
-def java_iter(iterator):
-    if iterator is None:
-        return
-    try:
-        while iterator.hasNext():
-            yield iterator.next()
-        return
-    except AttributeError:
-        pass
-    for value in iterator:
-        yield value
-
-
 def check_cancelled():
     if SCRIPT_MONITOR is not None:
         SCRIPT_MONITOR.checkCancelled()
@@ -108,10 +114,6 @@ def sha256_text(value):
 
 def hash_parts(parts):
     return sha256_text("\x1f".join(str(part) for part in parts))
-
-
-def address_text(address):
-    return "" if address is None else str(address)
 
 
 def relative_offset(address, entry):
@@ -145,17 +147,6 @@ def normalize_instruction_text(instruction):
     return " ".join(text.split())
 
 
-def flow_properties(flow):
-    return {
-        "call": method_bool(flow, "isCall"),
-        "jump": method_bool(flow, "isJump"),
-        "conditional": method_bool(flow, "isConditional"),
-        "computed": method_bool(flow, "isComputed"),
-        "terminal": method_bool(flow, "isTerminal"),
-        "fallthrough": method_bool(flow, "isFallthrough"),
-    }
-
-
 def classify_edge(flow, source_instruction):
     properties = flow_properties(flow)
     source_properties = flow_properties(safe_call(source_instruction, "getFlowType"))
@@ -176,40 +167,6 @@ def classify_edge(flow, source_instruction):
         return "terminal"
     text = str(flow) if flow is not None else "unknown"
     return "unknown:" + text
-
-
-def get_script_arguments():
-    try:
-        return list(getScriptArgs())
-    except Exception:
-        return sys.argv[1:]
-
-
-def atomic_write_csv(path, header, rows):
-    temporary_path = path + ".tmp"
-    with open(temporary_path, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(header)
-        writer.writerows(rows)
-        csv_file.flush()
-        try:
-            os.fsync(csv_file.fileno())
-        except Exception:
-            pass
-    os.replace(temporary_path, path)
-
-
-def atomic_write_json(path, value):
-    temporary_path = path + ".tmp"
-    with open(temporary_path, "w", encoding="utf-8") as json_file:
-        json.dump(value, json_file, ensure_ascii=False, indent=2, sort_keys=True)
-        json_file.write("\n")
-        json_file.flush()
-        try:
-            os.fsync(json_file.fileno())
-        except Exception:
-            pass
-    os.replace(temporary_path, path)
 
 
 def get_all_functions(program):
@@ -395,19 +352,6 @@ def empty_cfg(descriptor, status="FAILED", phase="cfg", error=None):
     }
 
 
-def get_block_start(block):
-    start = safe_call(block, "getFirstStartAddress")
-    return start if start is not None else safe_call(block, "getMinAddress")
-
-
-def collect_block_instructions(program, block):
-    instructions = []
-    iterator = program.getListing().getInstructions(block, True)
-    for instruction in java_iter(iterator):
-        instructions.append(instruction)
-    return instructions
-
-
 def calculate_degrees(blocks, edges):
     indegree = {block_id: 0 for block_id in blocks}
     outdegree = {block_id: 0 for block_id in blocks}
@@ -516,7 +460,7 @@ def extract_function_cfg(program, block_model, descriptor):
                 continue
 
             block_id = address_text(start)
-            instructions = collect_block_instructions(program, block)
+            instructions = collect_block_instructions(program.getListing(), block)
             mnemonic_parts = []
             instruction_parts = []
             for instruction in instructions:

@@ -15,13 +15,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 
+import numpy as np
+import tensorflow as tf
+import yaml
+from tensorflow.keras.models import load_model
+from tqdm import tqdm
+
+from dataset_builder import INPUT_FIELDS, PAD_ID
+from models.common import LearnedPositionEmbedding
+
 
 def load_config(path: Path) -> SimpleNamespace:
-    try:
-        import yaml
-    except ModuleNotFoundError as exc:
-        raise ValueError("PyYAML is required to read config.yaml") from exc
-
     with path.open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
     if not isinstance(raw, dict):
@@ -47,17 +51,11 @@ def load_config(path: Path) -> SimpleNamespace:
 
 
 def configure_gpu_memory_growth() -> None:
-    import tensorflow as tf
-
     for gpu in tf.config.list_physical_devices("GPU"):
         tf.config.experimental.set_memory_growth(gpu, True)
 
 
 def load_flow_model(model_path: Path) -> Any:
-    from tensorflow.keras.models import load_model
-
-    from models.common import LearnedPositionEmbedding
-
     custom_objects = {
         "LearnedPositionEmbedding": LearnedPositionEmbedding,
         "FlowModels>LearnedPositionEmbedding": LearnedPositionEmbedding,
@@ -88,10 +86,6 @@ def token_name(vocabs: Dict[str, List[str]], vocab_name: str, token_id: int) -> 
 
 class EncodedFlowDataset:
     def __init__(self, dataset_dir: Path) -> None:
-        import numpy as np
-
-        from dataset_builder import INPUT_FIELDS, PAD_ID
-
         self.np = np
         self.input_fields = tuple(INPUT_FIELDS)
         self.pad_id = int(PAD_ID)
@@ -153,6 +147,45 @@ class EncodedFlowDataset:
         )
 
 
+def validate_model(model: Any, dataset: "EncodedFlowDataset", max_seq_len: int) -> None:
+    """校验模型的输入字段/序列长度/输出维度与数据集一致。
+
+    predict.max_seq_len 与训练时固定的输入长度、以及输出层维度和词表必须匹配，
+    否则要么在 predict 时抛出难以理解的形状错误，要么静默给出错误的打分。
+    """
+    input_names = {tensor.name.split(":", 1)[0].split("/")[-1] for tensor in model.inputs}
+    if input_names != set(INPUT_FIELDS):
+        raise ValueError(
+            f"model inputs {sorted(input_names)} do not match dataset fields {sorted(INPUT_FIELDS)}"
+        )
+
+    sequence_lengths = {tensor.shape[1] for tensor in model.inputs}
+    if len(sequence_lengths) != 1 or None in sequence_lengths:
+        raise ValueError(f"model inputs must have one fixed sequence length: {sequence_lengths}")
+    model_seq_len = int(next(iter(sequence_lengths)))
+    if model_seq_len != max_seq_len:
+        raise ValueError(
+            f"predict.max_seq_len ({max_seq_len}) does not match the model's fixed "
+            f"input length ({model_seq_len}); set predict.max_seq_len to {model_seq_len}"
+        )
+
+    vocab_sizes = {
+        name: len(tokens) for name, tokens in dataset.vocabs.items()
+    }
+    output_sizes = {
+        name: int(tensor.shape[-1])
+        for name, tensor in zip(model.output_names, model.outputs)
+    }
+    expected = {
+        "next_dst_node": int(vocab_sizes.get("node", -1)),
+        "next_ctrl_type": int(vocab_sizes.get("ctrl_type", -1)),
+    }
+    if output_sizes != expected:
+        raise ValueError(
+            f"model outputs {output_sizes} do not match dataset vocabularies {expected}"
+        )
+
+
 def output_dict(model: Any, predictions: Any) -> Dict[str, Any]:
     if isinstance(predictions, dict):
         return predictions
@@ -178,9 +211,6 @@ def iter_scores(
     ctrl_weight: float,
     show_progress: bool,
 ) -> Iterator[Dict[str, Any]]:
-    import numpy as np
-    from tqdm import tqdm
-
     target_rows = dataset.valid_targets
     if limit > 0:
         target_rows = target_rows[:limit]
@@ -195,10 +225,12 @@ def iter_scores(
         x = dataset.make_batch(batch_rows, max_seq_len)
         true_dst_ids, true_ctrl_ids = dataset.target_ids(batch_rows)
 
-        raw_predictions = model.predict(x, batch_size=len(batch_rows), verbose=0)
+        raw_predictions = model(x, training=False)
         predictions = output_dict(model, raw_predictions)
-        dst_probs = predictions["next_dst_node"]
-        ctrl_probs = predictions["next_ctrl_type"]
+        # model(x) 返回 eager TF 张量；一次性转成 numpy，后续逐行索引才不会
+        # 每次触发单元素 gather + 主机同步。
+        dst_probs = np.asarray(predictions["next_dst_node"])
+        ctrl_probs = np.asarray(predictions["next_ctrl_type"])
 
         pred_dst_ids = np.argmax(dst_probs, axis=1)
         pred_ctrl_ids = np.argmax(ctrl_probs, axis=1)
@@ -235,13 +267,13 @@ def iter_scores(
 def should_alarm(
     window: Deque[Tuple[int, bool, float]],
     *,
+    low_count: int,
     low_threshold: int,
     full_window_size: int,
     partial: bool,
 ) -> bool:
     if not partial and len(window) < full_window_size:
         return False
-    low_count = sum(1 for _, is_low, _ in window if is_low)
     return low_count >= low_threshold
 
 
@@ -260,6 +292,7 @@ def write_report(cfg: SimpleNamespace) -> Dict[str, Any]:
     configure_gpu_memory_growth()
     dataset = EncodedFlowDataset(dataset_dir)
     model = load_flow_model(model_path)
+    validate_model(model, dataset, max_seq_len)
 
     output_path = cfg.output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,6 +343,7 @@ def write_report(cfg: SimpleNamespace) -> Dict[str, Any]:
 
             if should_alarm(
                 window,
+                low_count=window_low_count,
                 low_threshold=int(cfg.window_low_threshold),
                 full_window_size=int(cfg.window_size),
                 partial=bool(cfg.partial_window),

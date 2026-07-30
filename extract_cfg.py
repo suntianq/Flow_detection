@@ -14,8 +14,6 @@ script argument is the output directory; the optional second argument is
 
 from __future__ import print_function
 
-import csv
-import json
 import os
 import sys
 import time
@@ -26,9 +24,47 @@ from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.util.task import ConsoleTaskMonitor
 
+# ghidra_common lives next to this script; when run as a Ghidra postScript the
+# script directory is not always on sys.path, so add it defensively.  The
+# module imports nothing from ghidra.*, so this is safe outside Ghidra too.
+try:
+    from ghidra_common import (
+        address_text,
+        atomic_write_csv as _atomic_write_csv,
+        atomic_write_json,
+        bool_int,
+        collect_block_instructions,
+        flow_properties,
+        get_block_start,
+        get_script_arguments,
+        java_iter,
+        method_bool,
+        safe_call,
+    )
+except ImportError:
+    try:
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        _script_dir = os.getcwd()
+    if _script_dir not in sys.path:
+        sys.path.insert(0, _script_dir)
+    from ghidra_common import (
+        address_text,
+        atomic_write_csv as _atomic_write_csv,
+        atomic_write_json,
+        bool_int,
+        collect_block_instructions,
+        flow_properties,
+        get_block_start,
+        get_script_arguments,
+        java_iter,
+        method_bool,
+        safe_call,
+    )
+
 
 CONFIG = {
-    "out_dir": "/home/ali/workspace/static_analysis_test",
+    "out_dir": "/workspace/static_analysis",
     "fast_mode": False,
     "decomp_timeout": 30,
     "progress_interval": 50,
@@ -64,32 +100,6 @@ def log(message, log_fp=None):
         log_fp.flush()
 
 
-def safe_call(obj, method_name, default=None):
-    """Call a zero-argument Java/Python method without hiding analysis errors."""
-    try:
-        return getattr(obj, method_name)()
-    except Exception:
-        return default
-
-
-def java_iter(iterator):
-    """Iterate either a Java iterator or a Python iterable."""
-    if iterator is None:
-        return
-    try:
-        while iterator.hasNext():
-            yield iterator.next()
-        return
-    except AttributeError:
-        pass
-    for value in iterator:
-        yield value
-
-
-def address_text(address):
-    return "" if address is None else str(address)
-
-
 def instruction_text(instruction):
     if instruction is None:
         return ""
@@ -97,28 +107,6 @@ def instruction_text(instruction):
         return instruction.toString()
     except Exception:
         return str(instruction)
-
-
-def bool_int(value):
-    return 1 if value else 0
-
-
-def method_bool(obj, method_name):
-    try:
-        return bool(getattr(obj, method_name)())
-    except Exception:
-        return False
-
-
-def flow_properties(flow):
-    return {
-        "call": method_bool(flow, "isCall"),
-        "jump": method_bool(flow, "isJump"),
-        "conditional": method_bool(flow, "isConditional"),
-        "computed": method_bool(flow, "isComputed"),
-        "terminal": method_bool(flow, "isTerminal"),
-        "fallthrough": method_bool(flow, "isFallthrough"),
-    }
 
 
 def address_offset(address, image_base):
@@ -131,15 +119,6 @@ def address_offset(address, image_base):
         return "0x{:x}".format(value)
     except Exception:
         return ""
-
-
-def get_block_start(block):
-    if block is None:
-        return None
-    start = safe_call(block, "getFirstStartAddress")
-    if start is not None:
-        return start
-    return safe_call(block, "getMinAddress")
 
 
 def detect_return_instruction(instruction):
@@ -190,14 +169,6 @@ def detect_return_instruction(instruction):
             )
             return ("return", "operand_heuristic") if is_return else ("", "")
     return "", ""
-
-
-def get_script_arguments():
-    """Use Ghidra postScript arguments, with sys.argv as an external fallback."""
-    try:
-        return list(getScriptArgs())
-    except Exception:
-        return sys.argv[1:]
 
 
 def program_metadata(program):
@@ -481,14 +452,6 @@ class AnalysisResult(object):
                 instruction_text(instruction),
             ))
         return rows
-
-
-def collect_block_instructions(listing, block):
-    instructions = []
-    iterator = listing.getInstructions(block, True)
-    for instruction in java_iter(iterator):
-        instructions.append(instruction)
-    return instructions
 
 
 def process_instruction(result, function_entry, block_start, instruction, is_last):
@@ -819,31 +782,8 @@ def analyze_program(program, fast_mode, out_dir):
 
 
 def atomic_write_csv(path, header, rows):
-    temporary_path = path + ".tmp"
-    with open(temporary_path, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(header)
-        for row in sorted(rows, key=lambda value: tuple(str(item) for item in value)):
-            writer.writerow(row)
-        csv_file.flush()
-        try:
-            os.fsync(csv_file.fileno())
-        except Exception:
-            pass
-    os.replace(temporary_path, path)
-
-
-def atomic_write_json(path, value):
-    temporary_path = path + ".tmp"
-    with open(temporary_path, "w", encoding="utf-8") as json_file:
-        json.dump(value, json_file, ensure_ascii=False, indent=2, sort_keys=True)
-        json_file.write("\n")
-        json_file.flush()
-        try:
-            os.fsync(json_file.fileno())
-        except Exception:
-            pass
-    os.replace(temporary_path, path)
+    """Write a sorted CSV; this script relies on deterministic row order."""
+    _atomic_write_csv(path, header, rows, sort=True)
 
 
 def write_outputs(result, out_dir):
