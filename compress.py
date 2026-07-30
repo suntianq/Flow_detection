@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prune, fine-tune, and quantize a trained flow model."""
+"""Prune and fine-tune a trained flow model."""
 
 from __future__ import annotations
 
@@ -8,10 +8,19 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import yaml
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras.models import load_model
+
+from models.common import LearnedPositionEmbedding
+from dataset_builder import INPUT_FIELDS
+from dataset_builder import FlowSequence, load_vocab_sizes
+from train import compile_model
+
 
 
 def load_config(path: Path) -> SimpleNamespace:
-    import yaml
 
     with path.open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
@@ -25,7 +34,6 @@ def load_config(path: Path) -> SimpleNamespace:
         dataset_dir=Path(dataset["dir"]),
         input_model=Path(compress["input_model"]),
         output_model=Path(compress["output_model"]),
-        output_tflite=Path(compress["output_tflite"]),
         batch_size=int(compress["batch_size"]),
         validation_split=float(training["validation_split"]),
         seed=int(training["seed"]),
@@ -36,10 +44,6 @@ def load_config(path: Path) -> SimpleNamespace:
         final_sparsity=float(compress["final_sparsity"]),
         pruning_updates=int(compress["pruning_updates"]),
         exclude_patterns=tuple(str(item).lower() for item in compress["exclude_patterns"]),
-        quantization=str(compress["quantization"]).lower(),
-        representative_samples=int(compress["representative_samples"]),
-        integer_only=bool(compress["integer_only"]),
-        allow_select_tf_ops=bool(compress["allow_select_tf_ops"]),
         loss_weight_dst_node=float(loss_weights["dst_node"]),
         loss_weight_ctrl_type=float(loss_weights["ctrl_type"]),
     )
@@ -60,36 +64,20 @@ def validate_config(cfg: SimpleNamespace) -> None:
         raise ValueError("sparsity must satisfy 0 <= initial_sparsity < final_sparsity < 1")
     if cfg.pruning_updates <= 0:
         raise ValueError("pruning_updates must be > 0")
-    if cfg.quantization not in {"dynamic", "float16", "int8"}:
-        raise ValueError("quantization must be dynamic, float16, or int8")
-    if cfg.quantization == "int8" and cfg.representative_samples <= 0:
-        raise ValueError("representative_samples must be > 0 for int8 quantization")
-    if cfg.integer_only and cfg.quantization != "int8":
-        raise ValueError("integer_only is only valid with int8 quantization")
-    if cfg.integer_only and cfg.allow_select_tf_ops:
-        raise ValueError("integer_only and allow_select_tf_ops cannot both be true")
 
-    paths = {cfg.input_model.resolve(), cfg.output_model.resolve(), cfg.output_tflite.resolve()}
-    if len(paths) != 3:
-        raise ValueError("input_model, output_model, and output_tflite must be different paths")
+    paths = {cfg.input_model.resolve(), cfg.output_model.resolve()}
+    if len(paths) != 2:
+        raise ValueError("input_model and output_model must be different paths")
     if cfg.output_model.suffix != ".keras":
         raise ValueError("output_model must end with .keras")
-    if cfg.output_tflite.suffix != ".tflite":
-        raise ValueError("output_tflite must end with .tflite")
 
 
 def configure_gpu_memory_growth() -> None:
-    import tensorflow as tf
-
     for gpu in tf.config.list_physical_devices("GPU"):
         tf.config.experimental.set_memory_growth(gpu, True)
 
 
 def load_flow_model(path: Path) -> Any:
-    from tensorflow.keras.models import load_model
-
-    from models.common import LearnedPositionEmbedding
-
     custom_objects = {
         "LearnedPositionEmbedding": LearnedPositionEmbedding,
         "FlowModels>LearnedPositionEmbedding": LearnedPositionEmbedding,
@@ -98,8 +86,6 @@ def load_flow_model(path: Path) -> Any:
 
 
 def selected_weights(model: Any, exclude_patterns: Sequence[str]) -> List[Any]:
-    import tensorflow as tf
-
     result = []
     for weight in model.trainable_weights:
         name = str(getattr(weight, "path", getattr(weight, "name", ""))).lower()
@@ -113,8 +99,6 @@ def selected_weights(model: Any, exclude_patterns: Sequence[str]) -> List[Any]:
 
 
 def sparsity_stats(weights: Iterable[Any]) -> Dict[str, Any]:
-    import numpy as np
-
     total = 0
     zeros = 0
     tensors = 0
@@ -140,9 +124,6 @@ def build_pruning_callback(
     exclude_patterns: Sequence[str],
 ) -> Any:
     """Build a gradual global magnitude-pruning callback."""
-    import numpy as np
-    import tensorflow as tf
-
     class MagnitudePruningCallback(tf.keras.callbacks.Callback):
         def __init__(self) -> None:
             super().__init__()
@@ -239,8 +220,6 @@ def build_pruning_callback(
 
 
 def validate_model_dataset(model: Any, vocab_sizes: Dict[str, int]) -> int:
-    from dataset_builder import INPUT_FIELDS
-
     input_names = {tensor.name.split(":", 1)[0].split("/")[-1] for tensor in model.inputs}
     if input_names != set(INPUT_FIELDS):
         raise ValueError(f"model inputs do not match dataset fields: {sorted(input_names)}")
@@ -264,72 +243,18 @@ def validate_model_dataset(model: Any, vocab_sizes: Dict[str, int]) -> int:
     return int(next(iter(sequence_lengths)))
 
 
-def representative_dataset(train_data: Any, sample_limit: int):
-    emitted = 0
-    for batch_index in range(len(train_data)):
-        inputs, _ = train_data[batch_index]
-        batch_size = len(next(iter(inputs.values())))
-        for row in range(batch_size):
-            yield {name: values[row : row + 1] for name, values in inputs.items()}
-            emitted += 1
-            if emitted >= sample_limit:
-                return
-
-
-def convert_tflite(model: Any, train_data: Any, cfg: SimpleNamespace) -> bytes:
-    import tensorflow as tf
-
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    converter.optimizations = [
-        tf.lite.Optimize.DEFAULT,
-        tf.lite.Optimize.EXPERIMENTAL_SPARSITY,
-    ]
-
-    if cfg.quantization == "float16":
-        converter.target_spec.supported_types = [tf.float16]
-    elif cfg.quantization == "int8":
-        converter.representative_dataset = lambda: representative_dataset(
-            train_data, cfg.representative_samples
-        )
-        if cfg.integer_only:
-            converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-
-    if cfg.allow_select_tf_ops:
-        converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS,
-            tf.lite.OpsSet.SELECT_TF_OPS,
-        ]
-        converter._experimental_lower_tensor_list_ops = False
-
-    try:
-        return converter.convert()
-    except Exception as exc:
-        raise RuntimeError(
-            "TFLite conversion failed. For recurrent models, try setting "
-            "compress.quantization to dynamic; if the target runtime provides "
-            "TensorFlow Select Ops, set compress.allow_select_tf_ops to true."
-        ) from exc
-
-
 def json_values(values: Dict[str, Any]) -> Dict[str, float]:
     return {name: float(value) for name, value in values.items()}
 
 
 def compress(cfg: SimpleNamespace) -> Dict[str, Any]:
-    import tensorflow as tf
-
-    from dataset_builder import FlowSequence, load_vocab_sizes
-    from train import compile_model
-
     configure_gpu_memory_growth()
     tf.keras.utils.set_random_seed(cfg.seed)
 
     dataset_dir = cfg.dataset_dir.expanduser().resolve()
     input_model = cfg.input_model.expanduser().resolve()
     output_model = cfg.output_model.expanduser().resolve()
-    output_tflite = cfg.output_tflite.expanduser().resolve()
     output_model.parent.mkdir(parents=True, exist_ok=True)
-    output_tflite.parent.mkdir(parents=True, exist_ok=True)
 
     vocab_sizes = load_vocab_sizes(dataset_dir)
     model = load_flow_model(input_model)
@@ -391,22 +316,13 @@ def compress(cfg: SimpleNamespace) -> Dict[str, Any]:
     with history_path.open("w", encoding="utf-8") as stream:
         json.dump(history.history, stream, ensure_ascii=False, indent=2)
 
-    tflite_model = convert_tflite(model, train_data, cfg)
-    interpreter = tf.lite.Interpreter(model_content=tflite_model)
-    interpreter.allocate_tensors()
-    output_tflite.write_bytes(tflite_model)
-
     input_size = input_model.stat().st_size
     keras_size = output_model.stat().st_size
-    tflite_size = output_tflite.stat().st_size
 
     report = {
         "config_file": str(cfg.config_file),
         "input_model": str(input_model),
         "output_model": str(output_model),
-        "output_tflite": str(output_tflite),
-        "quantization": cfg.quantization,
-        "integer_only": cfg.integer_only,
         "max_seq_len": max_seq_len,
         "settings": {
             "batch_size": cfg.batch_size,
@@ -416,8 +332,6 @@ def compress(cfg: SimpleNamespace) -> Dict[str, Any]:
             "initial_sparsity": cfg.initial_sparsity,
             "final_sparsity": cfg.final_sparsity,
             "pruning_updates": cfg.pruning_updates,
-            "representative_samples": cfg.representative_samples,
-            "allow_select_tf_ops": cfg.allow_select_tf_ops,
         },
         "baseline_metrics": baseline_metrics,
         "compressed_metrics": compressed_metrics,
@@ -426,14 +340,10 @@ def compress(cfg: SimpleNamespace) -> Dict[str, Any]:
         "file_sizes": {
             "input_keras": input_size,
             "pruned_keras": keras_size,
-            "sparse_quantized_tflite": tflite_size,
         },
         "size_reduction": {
             "pruned_keras": 1.0 - keras_size / input_size,
-            "sparse_quantized_tflite": 1.0 - tflite_size / input_size,
         },
-        "tflite_inputs": [item["name"] for item in interpreter.get_input_details()],
-        "tflite_outputs": [item["name"] for item in interpreter.get_output_details()],
     }
     report_path = output_model.with_suffix(output_model.suffix + ".compression.json")
     with report_path.open("w", encoding="utf-8") as stream:
@@ -444,7 +354,7 @@ def compress(cfg: SimpleNamespace) -> Dict[str, Any]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Prune, fine-tune, and quantize a flow model.")
+    parser = argparse.ArgumentParser(description="Prune and fine-tune a flow model.")
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
     return parser
 
@@ -460,13 +370,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error(str(exc))
 
     sizes = report["file_sizes"]
-    print("compression complete")
+    print("pruning and fine-tuning complete")
     print(f"pruned sparsity: {report['compressed_sparsity']['sparsity']:.2%}")
     print(f"input keras: {sizes['input_keras'] / 1024**2:.2f} MiB")
     print(f"pruned keras: {sizes['pruned_keras'] / 1024**2:.2f} MiB")
-    print(f"quantized tflite: {sizes['sparse_quantized_tflite'] / 1024**2:.2f} MiB")
     print(f"keras model: {report['output_model']}")
-    print(f"tflite model: {report['output_tflite']}")
     print(f"report: {report['report']}")
     return 0
 
