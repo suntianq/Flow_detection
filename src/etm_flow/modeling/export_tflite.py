@@ -29,8 +29,8 @@ import tensorflow as tf
 import yaml
 from tensorflow.keras.models import load_model
 
-from dataset_builder import FlowSequence, load_vocab_sizes
-from models.common import LearnedPositionEmbedding
+from etm_flow.data.dataset import FlowSequence, load_vocab_sizes
+from etm_flow.modeling.models.common import LearnedPositionEmbedding
 
 
 def log_status(message: str) -> None:
@@ -67,7 +67,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Export a Keras model with a portable, CPU-traced TFLite graph."
     )
-    parser.add_argument("--config", type=Path, default=Path("config.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/default.yaml"))
     parser.add_argument(
         "--input-model",
         type=Path,
@@ -574,7 +574,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"report: {report_path}")
         return 0
     except (ImportError, KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
-        raise SystemExit(f"export_portable_tflite.py: error: {exc}") from exc
+        raise SystemExit(f"etm-export-tflite: error: {exc}") from exc
 
 
 if __name__ == "__main__":

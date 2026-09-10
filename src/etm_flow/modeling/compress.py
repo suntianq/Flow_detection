@@ -13,10 +13,9 @@ import tensorflow as tf
 import numpy as np
 from tensorflow.keras.models import load_model
 
-from models.common import LearnedPositionEmbedding
-from dataset_builder import INPUT_FIELDS
-from dataset_builder import FlowSequence, load_vocab_sizes
-from train import compile_model
+from etm_flow.data.dataset import INPUT_FIELDS, FlowSequence, load_vocab_sizes
+from etm_flow.modeling.models.common import LearnedPositionEmbedding
+from etm_flow.modeling.train import compile_model
 
 
 
@@ -355,7 +354,7 @@ def compress(cfg: SimpleNamespace) -> Dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prune and fine-tune a flow model.")
-    parser.add_argument("--config", type=Path, default=Path("config.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/default.yaml"))
     return parser
 
 

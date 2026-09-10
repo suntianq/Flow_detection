@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Score flow-sequence datasets with a trained next-edge model.
 
-This script matches the current dataset format produced by dataset_builder.py:
+This script matches the current dataset format produced by ``etm-build-dataset``:
 one uint32 memmap per input field, PAD rows between segments, and targets at
 non-PAD rows whose previous row is also non-PAD.
 """
@@ -21,8 +21,8 @@ import yaml
 from tensorflow.keras.models import load_model
 from tqdm import tqdm
 
-from dataset_builder import INPUT_FIELDS, PAD_ID
-from models.common import LearnedPositionEmbedding
+from etm_flow.data.dataset import INPUT_FIELDS, PAD_ID
+from etm_flow.modeling.models.common import LearnedPositionEmbedding
 
 
 def load_config(path: Path) -> SimpleNamespace:
@@ -387,7 +387,12 @@ def write_report(cfg: SimpleNamespace) -> Dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Predict and score encoded flow sequences.")
-    parser.add_argument("--config", type=Path, default=Path("config.yaml"), help="Config YAML file.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/default.yaml"),
+        help="Config YAML file. Default: configs/default.yaml",
+    )
     return parser
 
 

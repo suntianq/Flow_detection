@@ -1,5 +1,5 @@
 dataset:
-  dir: vocabs
+  dir: flow_dataset
 
 model:
   # choices: cnn_lstm, lstm, gru, tcn, transformer
@@ -32,14 +32,14 @@ training:
   learning_rate: 0.0001
   seed: 1234
   mixed_precision: false
-  output_model: model_files/flow_cnn_lstm.keras
+  output_model: flow_model/flow_cnn_lstm.keras
   patience: 5
   lr_patience: 3
 
 compress:
-  input_model: model_files/flow_cnn_lstm.keras
-  output_model: model_files/flow_cnn_lstm_pruned.keras
-  output_tflite: model_files/flow_cnn_lstm_pruned_int8.tflite
+  input_model: flow_model/flow_cnn_lstm.keras
+  output_model: flow_model/flow_cnn_lstm_pruned.keras
+  output_tflite: flow_model/flow_cnn_lstm_pruned_int8.tflite
   batch_size: 128
   epochs: 5
   recovery_epochs: 1
@@ -59,10 +59,10 @@ loss_weights:
 
 predict:
   dataset_dir: flow_dataset
-  model: model_files/flow_cnn_lstm.keras
+  model: flow_model/flow_cnn_lstm.keras
   max_seq_len: 64
   batch_size: 128
-  output: prediction_report.jsonl
+  output: output/prediction_report.jsonl
   prob_threshold: 0.1
   window_size: 64
   window_low_threshold: 5

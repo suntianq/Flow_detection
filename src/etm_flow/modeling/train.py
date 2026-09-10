@@ -15,8 +15,8 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLRO
 from tensorflow.keras.mixed_precision import set_global_policy
 from tensorflow.keras.optimizers import Adam
 
-from dataset_builder import FlowSequence, load_vocab_sizes
-from models import build_model
+from etm_flow.data.dataset import FlowSequence, load_vocab_sizes
+from etm_flow.modeling.models import build_model
 
 
 def configure_gpu_memory_growth() -> None:
@@ -114,7 +114,12 @@ def write_training_config(cfg: SimpleNamespace, input_config_path: Path, vocab_s
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a structured flow next-token model.")
-    parser.add_argument("--config", type=Path, default=Path("config.yaml"), help="Training config YAML file.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/default.yaml"),
+        help="Training config YAML file. Default: configs/default.yaml",
+    )
     return parser
 
 

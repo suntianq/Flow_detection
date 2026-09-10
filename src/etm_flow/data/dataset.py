@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and load flow-sequence datasets for next-edge prediction.
 
-Input files are the JSONL files produced by preprocess_flow_jsonl.py.  This
+Input files are the JSONL files produced by ``etm-preprocess``.  This
 module combines three responsibilities that are tightly coupled at this stage:
 
 * scan sequence JSONL files and build per-field vocabularies;

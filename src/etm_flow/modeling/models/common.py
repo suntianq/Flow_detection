@@ -9,7 +9,7 @@ from tensorflow.keras.layers import Activation, Concatenate, Dense, Embedding, I
 from tensorflow.keras.layers import Layer
 from tensorflow.keras.saving import register_keras_serializable
 
-from dataset_builder import INPUT_FIELDS
+from etm_flow.data.dataset import INPUT_FIELDS
 
 
 @register_keras_serializable(package="FlowModels")

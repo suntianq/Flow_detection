@@ -3662,7 +3662,7 @@ def _run_batch_mode(
 def main() -> int:
     parser = build_argument_parser()
     args = parser.parse_args()
-    print(f"[INFO] trbe_symbolize_sysmgr version={SCRIPT_VERSION}", file=sys.stderr)
+    print(f"[INFO] etm-symbolize version={SCRIPT_VERSION}", file=sys.stderr)
     print(f"[INFO] script_path={Path(__file__).resolve()}", file=sys.stderr)
 
     maps_path = Path(args.maps).expanduser().resolve() if args.maps else None
