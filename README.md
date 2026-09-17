@@ -58,8 +58,16 @@ python -m pip install -e .
 # 1. 查看 Trace 符号化参数
 etm-symbolize --help
 
-# 2. 将符号化 JSONL 转换为连续控制流序列
+# 多模块场景应同时配置主程序和所有文件型可执行共享库
+etm-symbolize --trace <trace.txt> --maps <maps.txt> \
+  --module-config <modules.json> --out <symbolized.jsonl>
+
+# 2. 将符号化 JSONL 转换为保留丢包/冲突证据的控制流序列（默认）
 etm-preprocess --input <symbolized.jsonl> --output-dir flow_preprocessed
+
+# 如需复现实验中的旧版严格过滤行为
+etm-preprocess --input <symbolized.jsonl> --output-dir flow_strict \
+  --recovery-policy strict
 
 # 3. 构建训练数据集
 etm-build-dataset --input flow_preprocessed --recursive --output-dir flow_dataset
@@ -74,6 +82,36 @@ etm-export-tflite
 ```
 
 配置中的相对路径均以执行命令时所在目录为基准，因此建议始终在仓库根目录运行命令。
+
+## 恢复策略与异常证据
+
+预处理默认使用 `evidence` 策略。它不会把 ROP 或 Address 包丢失造成的异常路径静默删除：
+
+- 软件返回栈推测的 `RET` 目标在被后续真实指令范围确认前标记为 `speculative`；预测目标与实际重同步地址不一致时标记为 `conflict`，并保留 `expected_pc` 与 `observed_pc`。
+- 目标不可恢复的控制转移仍保留控制类型，但目的地址写成 `<UNKNOWN_TARGET>`。
+- `flow_gap`/overflow 写成显式 `<GAP>` token；重同步后的第一条跨断点转移标记为 `after_gap`，不会伪装成连续路径。
+- maps 中存在但没有配置 ELF 的可执行模块写成带模块名和文件相对偏移的 `<opaque>` gap，不再与普通丢包混为同一个无身份节点。
+
+软件返回栈之后、真实 Address 锚点之前的传递路径会标记为 `path_confidence=speculative`。这能避免“ROP 改写了真实返回目标，同时纠正该目标的 Address 包又丢失”时，把沿错误预测地址解出的路径误当作真值。
+
+数据集会生成 `target_valid.dat`、`control_valid.dat`、`transition_valid.dat` 和 `is_gap.dat`。训练时，未知目的地址只屏蔽目的地址损失，控制类型仍参与训练；推测路径和跨丢包边界的样本全部屏蔽。推理报告会分别写成 `unscored_speculative_path` 或 `unscored_discontinuous_transition`，其他有效片段继续正常打分。因此训练集和真实测试数据应采用同一套默认策略，训练集还应覆盖正常采集条件下的典型丢包率；不要把 ROP 样本作为正常噪声注入训练集。
+
+上述字段改变了符号化事件、数据集格式和词表。升级后必须从 `etm-symbolize` 开始重新生成数据，再运行 `etm-preprocess`、`etm-build-dataset` 并重新训练模型；旧的 JSONL、`.dat` 数据集和旧模型不能直接混用。
+
+带上述模块与恢复证据字段的符号化格式版本为 `2.8.0`，预处理片段的 `schema_version` 为 `3`，编码数据集的 `format_version` 为 `4`。
+
+## 多模块与模型输入
+
+ROP gadget 可能来自主程序、libc、动态链接器或业务 `.so`。这些模块必须使用同一次运行的 maps 和完全匹配的 ELF 一起配置；stripped ELF 也可以用于反汇编，无符号位置使用稳定的模块相对 ELF 地址表示。模块配置格式可参考 `configs/modules.example.json`。
+
+模型使用八路因子化输入：
+
+```text
+src_module, src_ctrl_func, src_ctrl_off, ctrl_type,
+dst_module, dst_func, dst_off, icount
+```
+
+已经验证冗余的 `entry_func`、`entry_off` 不再编码。历史目的地拆分成 module/function/offset，联合的 `module::function@offset` 节点只作为 `next_dst_node` 预测标签。源和目标共享 module、function、offset embedding，能够直接学习跨模块转移，同时避免把同名函数或 stripped 共享库位置合并。
 
 ## Ghidra 工具
 

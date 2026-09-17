@@ -44,7 +44,10 @@ def compile_model(model: Any, cfg: SimpleNamespace, vocab_sizes: Dict[str, int])
         optimizer=Adam(learning_rate=float(cfg.learning_rate)),
         loss=losses,
         loss_weights=build_loss_weights(cfg),
-        metrics=metrics,
+        # FlowSequence supplies per-output masks.  Keep reported accuracy aligned
+        # with the masked loss instead of counting unknown destinations or
+        # transitions immediately following a trace gap.
+        weighted_metrics=metrics,
     )
 
 

@@ -76,6 +76,7 @@ def build_token_encoder(
     model_dim = int(cfg_value(cfg, "model_dim", 128))
 
     sizes = {
+        "module": positive_vocab_size(vocab_sizes, "module"),
         "function": positive_vocab_size(vocab_sizes, "function"),
         "offset": positive_vocab_size(vocab_sizes, "offset"),
         "node": positive_vocab_size(vocab_sizes, "node"),
@@ -87,6 +88,12 @@ def build_token_encoder(
         for field in INPUT_FIELDS
     }
 
+    module_embedding = Embedding(
+        input_dim=sizes["module"],
+        output_dim=int(cfg_value(cfg, "module_emb_dim", 16)),
+        mask_zero=mask_zero,
+        name="module_embedding",
+    )
     function_embedding = Embedding(
         input_dim=sizes["function"],
         output_dim=int(cfg_value(cfg, "function_emb_dim", 48)),
@@ -98,12 +105,6 @@ def build_token_encoder(
         output_dim=int(cfg_value(cfg, "offset_emb_dim", 32)),
         mask_zero=mask_zero,
         name="offset_embedding",
-    )
-    node_embedding = Embedding(
-        input_dim=sizes["node"],
-        output_dim=int(cfg_value(cfg, "node_emb_dim", 64)),
-        mask_zero=mask_zero,
-        name="node_embedding",
     )
     ctrl_type_embedding = Embedding(
         input_dim=sizes["ctrl_type"],
@@ -119,12 +120,13 @@ def build_token_encoder(
     )
 
     embedded = [
-        function_embedding(inputs["entry_func"]),
-        offset_embedding(inputs["entry_off"]),
+        module_embedding(inputs["src_module"]),
         function_embedding(inputs["src_ctrl_func"]),
         offset_embedding(inputs["src_ctrl_off"]),
         ctrl_type_embedding(inputs["ctrl_type"]),
-        node_embedding(inputs["dst_node"]),
+        module_embedding(inputs["dst_module"]),
+        function_embedding(inputs["dst_func"]),
+        offset_embedding(inputs["dst_off"]),
         icount_embedding(inputs["icount"]),
     ]
     x = Concatenate(name="field_concat")(embedded)

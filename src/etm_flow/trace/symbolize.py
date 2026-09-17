@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, TextIO, Tuple
 
-SCRIPT_VERSION = "2.6.0"
+SCRIPT_VERSION = "2.8.0"
 
 try:
     from elftools.elf.elffile import ELFFile
@@ -281,6 +281,7 @@ class ElfImage:
         self.machine = "?"
         self.entry = 0
         self.elf_class = 0
+        self.build_id: Optional[str] = None
         self.little_endian = True
         self.load_segments: List[LoadSegment] = []
         self.sections: List[SectionRange] = []
@@ -306,6 +307,24 @@ class ElfImage:
             self.entry = int(elf.header["e_entry"])
             self.elf_class = int(elf.elfclass)
             self.little_endian = bool(elf.little_endian)
+
+            try:
+                build_id_section = elf.get_section_by_name(".note.gnu.build-id")
+                if build_id_section is not None:
+                    for note in build_id_section.iter_notes():
+                        if str(note.get("n_type")) not in {"NT_GNU_BUILD_ID", "3"}:
+                            continue
+                        descriptor = note.get("n_desc")
+                        if isinstance(descriptor, bytes):
+                            self.build_id = descriptor.hex()
+                        elif descriptor is not None:
+                            self.build_id = str(descriptor).lower()
+                        break
+            except Exception as exc:
+                print(
+                    f"[WARN] {self.path.name} 的 GNU Build ID 未解析：{exc}",
+                    file=sys.stderr,
+                )
 
             load_index = 0
             for segment in elf.iter_segments():
@@ -847,6 +866,7 @@ class PendingAddressTarget:
     range_atom: Optional[str] = None
     range_taken: Optional[bool] = None
     range_reason: Optional[str] = None
+    path_confidence: str = "exact"
     exception_type: Optional[str] = None
     exception_addr: Optional[int] = None
     raw: Optional[str] = None
@@ -864,6 +884,7 @@ class ModuleResolver:
         self.map_index = MapIndex(maps)
         self.addr2line = addr2line
         self.module_hits = Counter()
+        self.unconfigured_map_hits = Counter()
 
     @staticmethod
     def _score_candidate(
@@ -937,6 +958,8 @@ class ModuleResolver:
                 reason = "address-not-in-maps"
             elif "x" not in mapping.perms:
                 reason = "address-in-non-executable-map"
+            elif mapping is not None:
+                self.unconfigured_map_hits[mapping.display_name] += 1
             return Resolution(
                 runtime_addr=addr,
                 mapping=mapping,
@@ -1000,6 +1023,8 @@ class ModuleResolver:
                 reason = "address-not-in-maps"
             elif "x" not in mapping.perms:
                 reason = "address-in-non-executable-map"
+            elif mapping is not None:
+                self.unconfigured_map_hits[mapping.display_name] += 1
             return FastResolution(
                 runtime_addr=addr,
                 mapping=mapping,
@@ -1151,11 +1176,11 @@ class EventWriter:
             module_records: List[Dict[str, Any]] = []
             for module in modules:
                 item: Dict[str, Any] = {
+                    "name": module.name,
                     "elf": str(module.elf_path),
                     "load_bias": self._hex(module.load_bias),
+                    "build_id": module.image.build_id if module.image else None,
                 }
-                if self.include_module:
-                    item["name"] = module.name
                 module_records.append(item)
             self.write_json(
                 {
@@ -1181,6 +1206,7 @@ class EventWriter:
                         "name": module.name,
                         "elf": str(module.elf_path),
                         "load_bias": self._hex(module.load_bias),
+                        "build_id": module.image.build_id if module.image else None,
                         "inferred_from": module.inferred_from,
                         "context_ids": [self._hex(v) for v in sorted(module.context_ids)]
                         if module.context_ids
@@ -1301,7 +1327,7 @@ class EventWriter:
                     "target_resolved": target.module is not None,
                 }
             )
-            if self.include_module and target.module is not None:
+            if target.module is not None:
                 record["target_module"] = target.module.name
         self.write_json(record)
 
@@ -1327,6 +1353,10 @@ class EventWriter:
                         "map_offset": self._hex(
                             mapping.offset_of(resolution.runtime_addr)
                         ),
+                        "map_file_offset": self._hex(
+                            mapping.pgoff
+                            + mapping.offset_of(resolution.runtime_addr)
+                        ),
                     }
                 )
             if module is not None:
@@ -1338,8 +1368,7 @@ class EventWriter:
                         "source": resolution.source,
                     }
                 )
-                if self.include_module:
-                    record["module"] = module.name
+                record["module"] = module.name
             self.write_json(record)
             return
 
@@ -1357,14 +1386,16 @@ class EventWriter:
                 "pgoff": self._hex(mapping.pgoff),
                 "path": mapping.path,
                 "offset": self._hex(mapping.offset_of(resolution.runtime_addr)),
+                "file_offset": self._hex(
+                    mapping.pgoff + mapping.offset_of(resolution.runtime_addr)
+                ),
             }
         if module is not None:
-            if self.include_module:
-                record["module"] = {
-                    "name": module.name,
-                    "elf": str(module.elf_path),
-                    "load_bias": self._hex(module.load_bias),
-                }
+            record["module"] = {
+                "name": module.name,
+                "elf": str(module.elf_path),
+                "load_bias": self._hex(module.load_bias),
+            }
             record["elf_va"] = self._hex(resolution.elf_va)
             record["file_offset"] = self._hex(resolution.file_offset)
         if segment is not None:
@@ -1436,7 +1467,7 @@ class EventWriter:
             "taken": taken,
             "next_pc": self._hex(next_pc, width=16),
         }
-        if self.include_module and resolution.module is not None:
+        if resolution.module is not None:
             record["module"] = resolution.module.name
         self.write_json(record)
 
@@ -1453,6 +1484,9 @@ class EventWriter:
         *,
         status: str = "resolved",
         reason: Optional[str] = None,
+        target_source: Optional[str] = None,
+        confidence: Optional[str] = None,
+        path_confidence: Optional[str] = None,
     ) -> None:
         start_symbol = self._symbol_text(start_resolution)
         end_symbol = self._symbol_text(end_resolution)
@@ -1470,6 +1504,9 @@ class EventWriter:
                 "atom": atom,
                 "status": status if status != "resolved" else None,
                 "reason": reason,
+                "target_source": target_source,
+                "confidence": confidence,
+                "path_confidence": path_confidence,
                 "runtime_start": self._hex(
                     start_resolution.runtime_addr, width=16
                 ),
@@ -1489,7 +1526,7 @@ class EventWriter:
                 },
                 "next_pc": self._hex(next_pc, width=16),
             }
-            if self.include_module and start_resolution.module is not None:
+            if start_resolution.module is not None:
                 record["module"] = start_resolution.module.name
             self.write_json(record)
             return
@@ -1500,6 +1537,9 @@ class EventWriter:
             "atom": atom,
             "status": status,
             "reason": reason,
+            "target_source": target_source,
+            "confidence": confidence,
+            "path_confidence": path_confidence,
             "runtime_start": self._hex(start_resolution.runtime_addr, width=16),
             "runtime_end": self._hex(runtime_end, width=16),
             "runtime_end_exclusive": self._hex(runtime_end_exclusive, width=16),
@@ -1520,7 +1560,7 @@ class EventWriter:
             },
             "next_pc": self._hex(next_pc, width=16),
         }
-        if self.include_module and start_resolution.module is not None:
+        if start_resolution.module is not None:
             record["module"] = start_resolution.module.name
         self.write_json(record)
 
@@ -1738,6 +1778,10 @@ class InstructionFollower:
         self._decoders: Dict[Tuple[Path, bool], AArch64InstructionDecoder] = {}
         self.last_gap_reason: Optional[str] = None
         self.pending_target: Optional[PendingAddressTarget] = None
+        # A software return stack predicts only the *expected* RET target.  Until
+        # a later Address packet anchors execution again, instructions decoded
+        # from that PC are a speculative path rather than ground truth.
+        self.speculative_path = False
 
     def _decoder_for(self, module: ModuleRule) -> AArch64InstructionDecoder:
         assert module.image is not None
@@ -1757,6 +1801,7 @@ class InstructionFollower:
         *,
         preserve_call_stack: bool = False,
     ) -> bool:
+        self.speculative_path = False
         if not preserve_call_stack:
             self.call_stack.clear()
         self.context_generation = context.generation
@@ -1846,6 +1891,7 @@ class InstructionFollower:
             range_atom=atom,
             range_taken=taken,
             range_reason=reason,
+            path_confidence="speculative" if self.speculative_path else "exact",
         )
         self.current_pc = None
         self.synced = False
@@ -1929,6 +1975,9 @@ class InstructionFollower:
             next_pc=target.runtime_addr if target is not None else None,
             status=status,
             reason=reason,
+            target_source="address_packet" if target is not None else "unknown",
+            confidence="exact" if target is not None else "unresolved",
+            path_confidence=pending.path_confidence,
         )
         self.stats["instruction_range"] += 1
 
@@ -2071,6 +2120,7 @@ class InstructionFollower:
         self.synced = False
         self.context_generation = None
         self.call_stack.clear()
+        self.speculative_path = False
         self.last_gap_reason = reason
         if emit_gap and was_synced:
             self.writer.flow_gap_line(context, reason, old_pc, detail)
@@ -2130,6 +2180,8 @@ class InstructionFollower:
             next_pc: Optional[int],
             status: str = "resolved",
             reason: Optional[str] = None,
+            target_source: Optional[str] = None,
+            confidence: Optional[str] = None,
         ) -> None:
             nonlocal range_start_resolution
             if range_start_resolution is None:
@@ -2145,6 +2197,27 @@ class InstructionFollower:
                 next_pc=next_pc,
                 status=status,
                 reason=reason,
+                target_source=target_source
+                or (
+                    "software_return_stack"
+                    if waypoint.kind == "return" and next_pc is not None
+                    else "static"
+                    if next_pc is not None
+                    else "unknown"
+                ),
+                confidence=confidence
+                or (
+                    "speculative"
+                    if waypoint.kind == "return" and next_pc is not None
+                    else "exact"
+                    if next_pc is not None and status == "resolved"
+                    else "conflict"
+                    if status == "conflict"
+                    else "unresolved"
+                ),
+                path_confidence=(
+                    "speculative" if self.speculative_path else "exact"
+                ),
             )
             self.stats["instruction_range"] += 1
 
@@ -2342,6 +2415,7 @@ class InstructionFollower:
                         taken=True,
                         next_pc=next_pc,
                     )
+                    self.speculative_path = True
                     self.current_pc = next_pc
                     self.stats["atom_resolved"] += 1
                     return True
@@ -3003,6 +3077,7 @@ def process_trace(
         "addr2line_cache_hit": addr2line.cache_hits,
         "addr2line_cache_miss": addr2line.cache_misses,
         "module_hits": dict(resolver.module_hits),
+        "unconfigured_map_hits": dict(resolver.unconfigured_map_hits),
         "timing": stopwatch.summary(),
     }
 
@@ -3019,6 +3094,15 @@ def process_trace(
             print(
                 "  module hits: "
                 + ", ".join(f"{name}={count}" for name, count in resolver.module_hits.most_common()),
+                file=sys.stderr,
+            )
+        if resolver.unconfigured_map_hits:
+            print(
+                "  unconfigured executable maps: "
+                + ", ".join(
+                    f"{name}={count}"
+                    for name, count in resolver.unconfigured_map_hits.most_common()
+                ),
                 file=sys.stderr,
             )
         print(
@@ -3167,8 +3251,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--include-module",
         action="store_true",
         help=(
-            "在事件记录中保留 module 字段；单 ELF 模式默认省略，"
-            "多模块配置会自动保留"
+            "已弃用的兼容参数；配置模块的 module 字段现在始终保留"
         ),
     )
     parser.add_argument(

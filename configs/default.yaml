@@ -5,9 +5,9 @@ model:
   # choices: cnn_lstm, lstm, gru, tcn, transformer
   name: cnn_lstm
   max_seq_len: 64
+  module_emb_dim: 16
   function_emb_dim: 48
   offset_emb_dim: 32
-  node_emb_dim: 64
   ctrl_type_emb_dim: 8
   icount_emb_dim: 8
   model_dim: 128

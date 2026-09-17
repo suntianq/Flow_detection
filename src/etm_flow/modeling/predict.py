@@ -21,7 +21,13 @@ import yaml
 from tensorflow.keras.models import load_model
 from tqdm import tqdm
 
-from etm_flow.data.dataset import INPUT_FIELDS, PAD_ID
+from etm_flow.data.dataset import (
+    AUX_FIELDS,
+    DATA_FIELDS,
+    INPUT_FIELDS,
+    PAD_ID,
+    validate_aux_schema,
+)
 from etm_flow.modeling.models.common import LearnedPositionEmbedding
 
 
@@ -93,6 +99,7 @@ class EncodedFlowDataset:
 
         with (self.dataset_dir / "meta.json").open("r", encoding="utf-8") as stream:
             self.meta = json.load(stream)
+        validate_aux_schema(self.meta)
         self.total_rows = int(self.meta["total_rows"])
         self.field_dtype = str(self.meta.get("field_dtype", "uint32"))
 
@@ -103,7 +110,16 @@ class EncodedFlowDataset:
                 mode="r",
                 shape=(self.total_rows,),
             )
-            for field in self.input_fields
+            for field in DATA_FIELDS
+        }
+        self.aux = {
+            field: np.memmap(
+                self.dataset_dir / f"{field}.dat",
+                dtype=str(self.meta.get("aux_dtype", "uint8")),
+                mode="r",
+                shape=(self.total_rows,),
+            )
+            for field in AUX_FIELDS
         }
         ctrl_type_values = np.asarray(self.fields["ctrl_type"])
         self.valid_targets = np.nonzero(
@@ -145,6 +161,13 @@ class EncodedFlowDataset:
             self.np.asarray(self.fields["dst_node"][rows], dtype=self.np.int64),
             self.np.asarray(self.fields["ctrl_type"][rows], dtype=self.np.int64),
         )
+
+    def target_quality(self, target_rows: Sequence[int]) -> Tuple[Any, Any, Any, Any]:
+        rows = self.np.asarray(target_rows, dtype=self.np.int64)
+        return tuple(
+            self.np.asarray(self.aux[field][rows], dtype=self.np.uint8)
+            for field in AUX_FIELDS
+        )  # type: ignore[return-value]
 
 
 def validate_model(model: Any, dataset: "EncodedFlowDataset", max_seq_len: int) -> None:
@@ -224,6 +247,12 @@ def iter_scores(
         batch_rows = target_rows[batch_start : batch_start + batch_size]
         x = dataset.make_batch(batch_rows, max_seq_len)
         true_dst_ids, true_ctrl_ids = dataset.target_ids(batch_rows)
+        (
+            target_valid_values,
+            control_valid_values,
+            transition_valid_values,
+            gap_values,
+        ) = dataset.target_quality(batch_rows)
 
         raw_predictions = model(x, training=False)
         predictions = output_dict(model, raw_predictions)
@@ -240,10 +269,27 @@ def iter_scores(
             true_ctrl_id = int(true_ctrl_ids[row])
             dst_prob = probability_at(dst_probs, row, true_dst_id)
             ctrl_prob = probability_at(ctrl_probs, row, true_ctrl_id)
-            if score_mode == "combined":
+            target_valid = bool(target_valid_values[row])
+            control_valid = bool(control_valid_values[row])
+            transition_valid = bool(transition_valid_values[row])
+            is_gap = bool(gap_values[row])
+            if not transition_valid:
+                score_prob: Optional[float] = None
+                score_basis = "unscored_discontinuous_transition"
+            elif not control_valid:
+                score_prob = None
+                score_basis = "unscored_speculative_path"
+            elif not target_valid:
+                # The destination is not ground truth, but the observed control
+                # event (RET/indirect/gap) is still scoreable evidence.
+                score_prob = ctrl_prob
+                score_basis = "ctrl_only_invalid_target"
+            elif score_mode == "combined":
                 score_prob = float(dst_prob * (ctrl_prob ** ctrl_weight))
+                score_basis = "combined"
             else:
                 score_prob = dst_prob
+                score_basis = "dst"
 
             yield {
                 "sample_index": sample_base + row,
@@ -260,6 +306,12 @@ def iter_scores(
                 "pred_ctrl_type": token_name(dataset.vocabs, "ctrl_type", int(pred_ctrl_ids[row])),
                 "score_mode": score_mode,
                 "score_prob": score_prob,
+                "score_basis": score_basis,
+                "score_valid": score_prob is not None,
+                "target_valid": target_valid,
+                "control_valid": control_valid,
+                "transition_valid": transition_valid,
+                "is_gap": is_gap,
             }
         sample_base += len(batch_rows)
 
@@ -298,6 +350,10 @@ def write_report(cfg: SimpleNamespace) -> Dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     total_samples = 0
+    unscored_samples = 0
+    invalid_target_samples = 0
+    invalid_control_samples = 0
+    gap_samples = 0
     low_samples = 0
     alarm_windows = 0
     max_window_low_count = 0
@@ -316,16 +372,45 @@ def write_report(cfg: SimpleNamespace) -> Dict[str, Any]:
             show_progress=bool(cfg.show_progress),
         ):
             target_row = int(record["target_row"])
-            if previous_target_row is None or target_row != previous_target_row + 1:
+            if (
+                previous_target_row is None
+                or target_row != previous_target_row + 1
+                or not bool(record["transition_valid"])
+            ):
                 window.clear()
             previous_target_row = target_row
 
             total_samples += 1
-            is_low = float(record["score_prob"]) < float(cfg.prob_threshold)
+            if not bool(record["target_valid"]):
+                invalid_target_samples += 1
+            if not bool(record["control_valid"]):
+                invalid_control_samples += 1
+            if bool(record["is_gap"]):
+                gap_samples += 1
+
+            if not bool(record["score_valid"]):
+                unscored_samples += 1
+                window.clear()
+                record.update(
+                    {
+                        "event": str(record["score_basis"]),
+                        "is_low_prob": None,
+                        "prob_threshold": float(cfg.prob_threshold),
+                        "window_size": int(cfg.window_size),
+                        "window_low_count": 0,
+                    }
+                )
+                # Discontinuities are evidence and must remain visible even when
+                # the next-edge probability is undefined.
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                continue
+
+            score_prob = float(record["score_prob"])
+            is_low = score_prob < float(cfg.prob_threshold)
             if is_low:
                 low_samples += 1
 
-            window.append((target_row, is_low, float(record["score_prob"])))
+            window.append((target_row, is_low, score_prob))
             window_low_count = sum(1 for _, item_is_low, _ in window if item_is_low)
             max_window_low_count = max(max_window_low_count, window_low_count)
             record.update(
@@ -365,12 +450,18 @@ def write_report(cfg: SimpleNamespace) -> Dict[str, Any]:
                 }
                 stream.write(json.dumps(alarm_record, ensure_ascii=False) + "\n")
 
-    low_ratio = (low_samples / total_samples) if total_samples else 0.0
+    scored_samples = total_samples - unscored_samples
+    low_ratio = (low_samples / scored_samples) if scored_samples else 0.0
     return {
         "dataset_dir": str(dataset_dir),
         "model": str(model_path),
         "output": str(output_path),
         "total_samples": total_samples,
+        "scored_samples": scored_samples,
+        "unscored_samples": unscored_samples,
+        "invalid_target_samples": invalid_target_samples,
+        "invalid_control_samples": invalid_control_samples,
+        "gap_samples": gap_samples,
         "low_samples": low_samples,
         "low_ratio": low_ratio,
         "alarm_windows": alarm_windows,
@@ -430,6 +521,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"dataset: {summary['dataset_dir']}")
     print(f"model: {summary['model']}")
     print(f"samples: {summary['total_samples']}")
+    print(f"scored_samples: {summary['scored_samples']}")
+    print(f"unscored_discontinuous: {summary['unscored_samples']}")
+    print(f"invalid_targets: {summary['invalid_target_samples']}")
+    print(f"invalid_controls: {summary['invalid_control_samples']}")
+    print(f"gap_samples: {summary['gap_samples']}")
     print(f"low_samples: {summary['low_samples']} ({summary['low_ratio']:.4%})")
     print(f"alarm_windows: {summary['alarm_windows']}")
     print(f"max_window_low_count: {summary['max_window_low_count']}")

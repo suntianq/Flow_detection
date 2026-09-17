@@ -1,0 +1,20 @@
+{
+  "page_size": "0x1000",
+  "modules": [
+    {
+      "name": "main",
+      "elf": "../elf/main.unstripped.elf",
+      "anchor_maps": ["/main(?:-main)?$"]
+    },
+    {
+      "name": "libc",
+      "elf": "../elf/libc.so",
+      "anchor_maps": ["/libc\\.so$"]
+    },
+    {
+      "name": "dynamic_linker",
+      "elf": "../elf/ld-linux-aarch64.so.1",
+      "anchor_maps": ["/ld-linux-aarch64\\.so\\.1$"]
+    }
+  ]
+}

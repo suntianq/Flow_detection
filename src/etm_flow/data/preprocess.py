@@ -2,8 +2,10 @@
 """Preprocess symbolized TRBE/ETM JSONL into structured flow sequences.
 
 The symbolizer emits low-level events such as address, instruction_range,
-context and flow_gap.  This preprocessor keeps only continuous target-ELF
-control flow and converts each valid instruction_range into one edge token:
+context and flow_gap.  In the default ``evidence`` policy the preprocessor
+keeps partially recovered ranges and explicit gap tokens instead of silently
+discarding them.  The legacy ``strict`` policy keeps only continuous,
+fully-recovered target-ELF control flow.
 
     branch/return/call instruction exit  ->  next_pc target entry
 
@@ -31,9 +33,18 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, TextIO, T
 
 
 UNKNOWN = "<unknown>"
+UNKNOWN_MODULE = "<UNKNOWN_MODULE>"
+ELF_LOCATION = "<elf>"
+OPAQUE_EXEC = "<opaque>"
+UNKNOWN_TARGET = "<UNKNOWN_TARGET>"
+GAP = "<GAP>"
 NORMAL_RANGE_STATUSES = {None, "", "resolved", "target_resolved"}
+EVIDENCE_RANGE_STATUSES = NORMAL_RANGE_STATUSES | {
+    "conflict",
+    "target_unknown",
+    "target_unresolved",
+}
 CUT_ADDRESS_REASONS = {
-    "no-configured-elf",
     "address-not-in-maps",
     "address-in-non-executable-map",
 }
@@ -74,6 +85,10 @@ def clean_json(value: Any) -> Any:
     if isinstance(value, list):
         return [clean_json(v) for v in value if v is not None]
     return value
+
+
+def as_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
@@ -137,8 +152,13 @@ def module_from_record(record: Dict[str, Any]) -> Optional[str]:
 
     map_name = record.get("map")
     if isinstance(map_name, str) and map_name and not map_name.startswith("["):
-        if record.get("elf_addr") is not None or record.get("elf_va") is not None:
-            return map_name
+        return Path(map_name).name or map_name
+
+    mapping = record.get("mapping")
+    if isinstance(mapping, dict):
+        path = mapping.get("path")
+        if isinstance(path, str) and path and not path.startswith("["):
+            return Path(path).name or path
     return None
 
 
@@ -211,6 +231,9 @@ class RangeInfo:
     reason: Optional[str]
     waypoint: Dict[str, Any]
     next_pc: Optional[int]
+    target_source: Optional[str]
+    confidence: Optional[str]
+    path_confidence: str
 
     @property
     def waypoint_kind(self) -> Optional[str]:
@@ -253,11 +276,15 @@ class FlowPreprocessor:
         include_module_in_token: bool,
         target_modules: Optional[Set[str]],
         min_segment_edges: int,
+        recovery_policy: str = "evidence",
     ) -> None:
+        if recovery_policy not in {"evidence", "strict"}:
+            raise ValueError("recovery_policy must be 'evidence' or 'strict'")
         self.sequence_stream = sequence_stream
         self.include_module_in_token = include_module_in_token
         self.target_modules = target_modules
         self.min_segment_edges = max(1, min_segment_edges)
+        self.recovery_policy = recovery_policy
 
         self.stats: Counter[str] = Counter()
         self.edge_types: Counter[str] = Counter()
@@ -279,6 +306,8 @@ class FlowPreprocessor:
         self.pending_range: Optional[RangeInfo] = None
         self.segment: Optional[SegmentState] = None
         self.segment_tokens: List[Dict[str, Any]] = []
+        self.next_token_after_gap = False
+
     def process_file(self, path: Path) -> None:
         last_event_index: Optional[int] = None
         for event_index, record in enumerate(iter_jsonl(path)):
@@ -307,7 +336,10 @@ class FlowPreprocessor:
             self.handle_instruction_range(record, event_index)
         elif event == "flow_gap":
             reason = str(record.get("reason") or "flow_gap")
-            self.break_segment(f"flow_gap:{reason}", event_index)
+            if self.recovery_policy == "evidence":
+                self.preserve_soft_gap(reason, event_index, record)
+            else:
+                self.break_segment(f"flow_gap:{reason}", event_index)
         elif event == "discontinuity":
             reason = str(record.get("reason") or "discontinuity")
             self.break_segment(f"discontinuity:{reason}", event_index)
@@ -316,7 +348,10 @@ class FlowPreprocessor:
             if kind != "conditional_flush":
                 self.break_segment(f"trace_control:{kind}", event_index)
         elif event == "overflow":
-            self.break_segment("overflow", event_index)
+            if self.recovery_policy == "evidence":
+                self.preserve_soft_gap("overflow", event_index, record)
+            else:
+                self.break_segment("overflow", event_index)
         elif event in {"exception", "exception_return"}:
             self.break_segment(event, event_index)
         else:
@@ -336,6 +371,113 @@ class FlowPreprocessor:
             self.stats[f"pending_edges_dropped_{reason}"] += 1
             self.pending_range = None
         self.close_segment(reason, event_index)
+
+    def ensure_segment(self, event_index: int) -> None:
+        if self.segment is not None:
+            return
+        segment_id = self.global_segment_index
+        self.global_segment_index += 1
+        self.segment = SegmentState(
+            segment_id=segment_id,
+            context=dict(self.current_context),
+            trace_info=dict(self.current_trace_info),
+            start_event_index=event_index,
+        )
+        self.segment_tokens.clear()
+
+    @staticmethod
+    def marker_location(
+        marker: str,
+        runtime_addr: Optional[int] = None,
+        module: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "module": module or UNKNOWN_MODULE,
+            "runtime_addr": hex_or_none(runtime_addr, width=16) or UNKNOWN,
+            "elf_addr": UNKNOWN,
+            "function": marker,
+            "function_offset": "0x0",
+        }
+
+    def preserve_soft_gap(
+        self,
+        reason: str,
+        event_index: int,
+        record: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Keep a loss marker in observation order without inventing a missing path."""
+        self.emit_pending_edge(None)
+        if (
+            self.next_token_after_gap
+            and self.segment_tokens
+            and as_dict(self.segment_tokens[-1].get("ctrl")).get("kind") == "flow_gap"
+        ):
+            quality = as_dict(self.segment_tokens[-1].get("quality"))
+            previous_reason = str(quality.get("reason") or "")
+            if reason and reason not in previous_reason.split(";"):
+                quality["reason"] = ";".join(item for item in (previous_reason, reason) if item)
+            self.stats["soft_gaps_coalesced"] += 1
+            return
+        self.ensure_segment(event_index)
+        assert self.segment is not None
+
+        gap_record = record or {}
+        runtime_addr = parse_int(
+            gap_record.get("pc")
+            or gap_record.get("address")
+            or gap_record.get("runtime_addr")
+        )
+        opaque_module = module_from_record(gap_record)
+        is_opaque_exec = reason == "unconfigured_executable_module"
+        if is_opaque_exec:
+            mapping = as_dict(gap_record.get("mapping"))
+            opaque_offset = parse_int(
+                gap_record.get("map_file_offset")
+                or mapping.get("file_offset")
+            )
+            location = {
+                "module": opaque_module or UNKNOWN_MODULE,
+                "runtime_addr": hex_or_none(runtime_addr, width=16) or UNKNOWN,
+                "elf_addr": UNKNOWN,
+                "function": OPAQUE_EXEC,
+                "function_offset": hex_or_none(opaque_offset) or UNKNOWN,
+            }
+        else:
+            location = self.marker_location(
+                GAP,
+                runtime_addr,
+                self.current_module or self.default_module,
+            )
+        gap_quality = {
+            "status": "gap",
+            "reason": reason,
+            "confidence": "observed",
+            "target_source": "none",
+            "target_valid": False,
+            "continuity": "continuous",
+            # For a return-stack mismatch, keep both addresses.  The expected
+            # value is a software reconstruction; the observed value is the
+            # first range at which decoding successfully resynchronised.
+            "expected_pc": (record or {}).get("pc"),
+            "observed_pc": (record or {}).get("observed_pc"),
+            "detail": (record or {}).get("detail"),
+        }
+        if self.segment.start is None:
+            self.segment.start = dict(location)
+        token: Dict[str, Any] = {
+            "entry": dict(location),
+            "src_ctrl": {**location, "asm": GAP},
+            "ctrl": {"kind": "flow_gap", "atom": reason},
+            "dst": dict(location),
+            "instruction_count": UNKNOWN,
+            "quality": clean_json(gap_quality),
+        }
+        self.segment_tokens.append(token)
+        self.segment.edge_count += 1
+        self.edge_types[f"gap:{reason}"] += 1
+        self.stats["output_gap_tokens"] += 1
+        self.stats["soft_gaps_preserved"] += 1
+        self.next_token_after_gap = True
 
     def handle_header(self, record: Dict[str, Any]) -> None:
         modules = record.get("modules")
@@ -379,6 +521,21 @@ class FlowPreprocessor:
         if info.module is None and elf is not None:
             info.module = self.current_module or self.default_module
 
+        if reason == "no-configured-elf":
+            if self.recovery_policy == "evidence":
+                if info.module:
+                    self.current_module = info.module
+                self.preserve_soft_gap(
+                    "unconfigured_executable_module",
+                    event_index,
+                    record,
+                )
+                self.stats["opaque_executable_module_gaps"] += 1
+            else:
+                self.break_segment("address:no-configured-elf", event_index)
+            self.stats["address_cut_no-configured-elf"] += 1
+            return
+
         if reason in CUT_ADDRESS_REASONS:
             pending_targets_this_address = (
                 self.pending_range is not None
@@ -408,6 +565,36 @@ class FlowPreprocessor:
                 self.stats["address_outside_target_module"] += 1
                 return
 
+        # An Address packet is independent evidence that can confirm or reject
+        # a software-return-stack prediction before the next range is emitted.
+        pending = self.pending_range
+        speculative_pending = pending is not None and (
+            pending.target_source == "software_return_stack"
+            or pending.path_confidence == "speculative"
+        )
+        if speculative_pending and runtime is not None and pending.next_pc is not None:
+            if pending.next_pc == runtime:
+                pending.confidence = "confirmed"
+                self.stats["speculative_targets_confirmed_by_address"] += 1
+            elif self.recovery_policy == "evidence":
+                expected_pc = pending.next_pc
+                self.stats["pc_mismatch"] += 1
+                self.stats["speculative_targets_rejected_by_address"] += 1
+                self.emit_pending_edge(
+                    None,
+                    target_valid=False,
+                    confidence="conflict",
+                    reason="address_anchor_mismatch",
+                )
+                self.preserve_soft_gap(
+                    "address_anchor_mismatch",
+                    event_index,
+                    {
+                        "pc": hex_or_none(expected_pc, width=16),
+                        "observed_pc": hex_or_none(runtime, width=16),
+                    },
+                )
+
         if runtime is not None:
             self.address_by_runtime[runtime] = info
         if elf is not None:
@@ -426,14 +613,38 @@ class FlowPreprocessor:
             self.stats["range_skipped_non_target"] += 1
             return
 
-        if status == "conflict":
-            self.break_segment("range_status:conflict", event_index)
-            self.stats["range_skipped_conflict"] += 1
+        if status not in EVIDENCE_RANGE_STATUSES:
+            self.break_segment(f"range_status:{status}", event_index)
+            self.stats["range_skipped_abnormal_status"] += 1
             return
 
         if status not in NORMAL_RANGE_STATUSES:
-            self.break_segment(f"range_status:{status}", event_index)
-            self.stats["range_skipped_abnormal_status"] += 1
+            if self.recovery_policy == "strict":
+                self.break_segment(f"range_status:{status}", event_index)
+                if status == "conflict":
+                    self.stats["range_skipped_conflict"] += 1
+                else:
+                    self.stats["range_skipped_abnormal_status"] += 1
+                return
+
+            if self.pending_range is not None:
+                if self.pending_range.next_pc == item.runtime_start:
+                    self.emit_pending_edge(item)
+                else:
+                    self.emit_pending_edge(
+                        None,
+                        target_valid=False,
+                        confidence="conflict",
+                        reason="range_before_partial_mismatch",
+                    )
+                    self.preserve_soft_gap("range_before_partial_mismatch", event_index)
+
+            # The source range and waypoint remain useful evidence even when the
+            # dynamic target is unknown or the Atom conflicts with the opcode.
+            self.start_segment(item)
+            self.emit_edge(item, None, target_valid=False)
+            self.stats["ranges_preserved_partial"] += 1
+            self.preserve_soft_gap(f"range_status:{status}", event_index, record)
             return
 
         if item.runtime_start is None or item.elf_start is None:
@@ -472,17 +683,38 @@ class FlowPreprocessor:
             return
 
         if self.pending_range.next_pc is None:
-            self.stats["pending_edges_dropped_missing_next_pc"] += 1
-            self.break_segment("missing_prev_next_pc", event_index, emit_pending=False)
-            self.start_segment(item)
+            if self.recovery_policy == "strict":
+                self.stats["pending_edges_dropped_missing_next_pc"] += 1
+                self.break_segment("missing_prev_next_pc", event_index, emit_pending=False)
+                self.start_segment(item)
+            else:
+                self.emit_pending_edge(None, target_valid=False)
+                self.preserve_soft_gap("missing_prev_next_pc", event_index)
             self.pending_range = item
             return
 
         if self.pending_range.next_pc != item.runtime_start:
-            self.emit_pending_edge(None)
-            self.close_segment("pc_mismatch", event_index)
             self.stats["pc_mismatch"] += 1
-            self.start_segment(item)
+            if self.recovery_policy == "strict":
+                self.emit_pending_edge(None)
+                self.close_segment("pc_mismatch", event_index)
+                self.start_segment(item)
+            else:
+                expected_pc = self.pending_range.next_pc
+                self.emit_pending_edge(
+                    None,
+                    target_valid=False,
+                    confidence="conflict",
+                    reason="pc_mismatch",
+                )
+                self.preserve_soft_gap(
+                    "pc_mismatch",
+                    event_index,
+                    {
+                        "pc": hex_or_none(expected_pc, width=16),
+                        "observed_pc": hex_or_none(item.runtime_start, width=16),
+                    },
+                )
             self.pending_range = item
             return
 
@@ -547,6 +779,21 @@ class FlowPreprocessor:
             reason=reason,
             waypoint=waypoint,
             next_pc=next_pc,
+            target_source=(
+                record.get("target_source")
+                if isinstance(record.get("target_source"), str)
+                else None
+            ),
+            confidence=(
+                record.get("confidence")
+                if isinstance(record.get("confidence"), str)
+                else None
+            ),
+            path_confidence=(
+                record.get("path_confidence")
+                if record.get("path_confidence") in {"exact", "speculative"}
+                else "exact"
+            ),
         )
 
     def lookup_address(self, runtime_addr: Optional[int], elf_addr: Optional[int]) -> Optional[AddressInfo]:
@@ -557,17 +804,11 @@ class FlowPreprocessor:
         return None
 
     def start_segment(self, item: RangeInfo) -> None:
-        if self.segment is not None:
-            return
-        segment_id = self.global_segment_index
-        self.global_segment_index += 1
-        self.segment = SegmentState(
-            segment_id=segment_id,
-            context=dict(item.context),
-            trace_info=dict(item.trace_info),
-            start_event_index=item.source_event_index,
-        )
-        self.segment_tokens.clear()
+        if self.segment is None:
+            self.ensure_segment(item.source_event_index)
+            assert self.segment is not None
+            self.segment.context = dict(item.context)
+            self.segment.trace_info = dict(item.trace_info)
 
     def close_segment(self, reason: str, event_index: Optional[int]) -> None:
         had_segment = self.segment is not None
@@ -578,6 +819,8 @@ class FlowPreprocessor:
                 write_json(
                     self.sequence_stream,
                     {
+                        "schema_version": 3,
+                        "recovery_policy": self.recovery_policy,
                         "segment_id": segment.segment_id,
                         "context": segment.context,
                         "trace_info": segment.trace_info,
@@ -595,6 +838,7 @@ class FlowPreprocessor:
         self.segment = None
         self.pending_range = None
         self.segment_tokens.clear()
+        self.next_token_after_gap = False
 
     def make_node(
         self,
@@ -605,8 +849,14 @@ class FlowPreprocessor:
         runtime_addr: Optional[int],
     ) -> Dict[str, Any]:
         function, func_off, _ = split_symbol(symbol)
+        if function == UNKNOWN and elf_addr is not None:
+            # Stripped shared objects still have stable module-relative ELF
+            # addresses.  Preserve them instead of collapsing every location
+            # into one OOV token.
+            function = ELF_LOCATION
+            func_off = elf_addr
         return {
-            "module": module or UNKNOWN,
+            "module": module or UNKNOWN_MODULE,
             "runtime_addr": hex_or_none(runtime_addr, width=16),
             "function": function,
             "function_offset": hex_or_none(func_off),
@@ -718,6 +968,7 @@ class FlowPreprocessor:
 
     def token_location(self, node: Dict[str, Any]) -> Dict[str, Any]:
         return {
+            "module": node.get("module") or UNKNOWN_MODULE,
             "runtime_addr": node.get("runtime_addr") or UNKNOWN,
             "elf_addr": node.get("elf_addr") or UNKNOWN,
             "function": node.get("function") or UNKNOWN,
@@ -727,10 +978,38 @@ class FlowPreprocessor:
     def make_structured_token(
         self,
         item: RangeInfo,
+        start_node: Dict[str, Any],
         exit_node: Dict[str, Any],
         entry_node: Dict[str, Any],
+        *,
+        target_valid: bool,
+        target_source: str,
+        confidence: str,
+        control_valid: bool,
+        path_confidence: str,
+        continuity: str,
+        reason: Optional[str],
     ) -> Dict[str, Any]:
+        quality = {
+            "status": item.status or "resolved",
+            "reason": reason,
+            "confidence": confidence,
+            "target_source": target_source,
+            "target_valid": target_valid,
+            "control_valid": control_valid,
+            "continuity": continuity,
+            "path_confidence": path_confidence,
+        }
+        if target_source == "software_return_stack":
+            if confidence == "confirmed":
+                quality["return_stack_match"] = True
+            elif confidence == "conflict":
+                quality["return_stack_match"] = False
+
         token = {
+            # Store the entry explicitly.  This matters after a soft gap: the
+            # destination of the gap marker is not the next real block entry.
+            "entry": self.token_location(start_node),
             "src_ctrl": {
                 **self.token_location(exit_node),
                 "asm": self.waypoint_asm(item),
@@ -743,42 +1022,144 @@ class FlowPreprocessor:
             "instruction_count": item.instruction_count
             if item.instruction_count is not None
             else UNKNOWN,
+            "quality": clean_json(quality),
         }
-        if self.include_module_in_token:
-            token["src_ctrl"]["module"] = exit_node.get("module") or UNKNOWN
-            token["dst"]["module"] = entry_node.get("module") or UNKNOWN
         return token
 
-    def emit_pending_edge(self, target_hint: Optional[RangeInfo]) -> None:
+    def emit_pending_edge(
+        self,
+        target_hint: Optional[RangeInfo],
+        *,
+        target_valid: Optional[bool] = None,
+        control_valid: Optional[bool] = None,
+        confidence: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
         if self.pending_range is None:
             return
         item = self.pending_range
         if item.next_pc is None:
-            self.stats["pending_edges_dropped_missing_next_pc"] += 1
-            self.pending_range = None
-            return
+            if self.recovery_policy == "strict":
+                self.stats["pending_edges_dropped_missing_next_pc"] += 1
+                self.pending_range = None
+                return
+            target_valid = False
         if self.segment is None:
             self.start_segment(item)
-        self.emit_edge(item, target_hint)
+        self.emit_edge(
+            item,
+            target_hint,
+            target_valid=target_valid,
+            control_valid=control_valid,
+            confidence=confidence,
+            reason=reason,
+        )
         self.pending_range = None
 
-    def emit_edge(self, item: RangeInfo, target_hint: Optional[RangeInfo]) -> None:
+    def infer_target_quality(
+        self,
+        item: RangeInfo,
+        target_hint: Optional[RangeInfo],
+    ) -> Tuple[str, str, bool]:
+        status = item.status or "resolved"
+        source = item.target_source
+        confidence = item.confidence
+
+        if (
+            target_hint is not None
+            and item.next_pc == target_hint.runtime_start
+            and target_hint.path_confidence != "speculative"
+        ):
+            source = source or "next_range"
+            confidence = "confirmed"
+        elif source is None:
+            if status == "target_resolved":
+                source = "address_packet"
+            elif status in {"target_unresolved", "target_unknown", "conflict"}:
+                source = "unknown"
+            elif item.waypoint_kind == "return":
+                source = "software_return_stack"
+            elif item.waypoint_kind in {"indirect_branch", "indirect_call"}:
+                source = "unknown"
+            else:
+                source = "static"
+
+        if confidence is None:
+            if status in {"target_unresolved", "target_unknown"} or source == "unknown":
+                confidence = "unresolved"
+            elif status == "conflict":
+                confidence = "conflict"
+            elif source == "software_return_stack":
+                confidence = "speculative"
+            else:
+                confidence = "exact"
+
+        target_valid = (
+            item.next_pc is not None
+            and status in NORMAL_RANGE_STATUSES
+            and confidence in {"exact", "confirmed"}
+        )
+        return source, confidence, target_valid
+
+    def emit_edge(
+        self,
+        item: RangeInfo,
+        target_hint: Optional[RangeInfo],
+        *,
+        target_valid: Optional[bool] = None,
+        control_valid: Optional[bool] = None,
+        confidence: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
         assert self.segment is not None
         control = self.edge_control(item)
         start_node = self.make_start_node(item)
         exit_node = self.make_exit_node(item)
-        entry_node = self.make_entry_node(item, target_hint)
+        target_source, inferred_confidence, inferred_valid = self.infer_target_quality(
+            item, target_hint
+        )
+        effective_confidence = confidence or inferred_confidence
+        effective_control_valid = (
+            item.path_confidence != "speculative"
+            if control_valid is None
+            else control_valid
+        )
+        effective_target_valid = inferred_valid if target_valid is None else target_valid
+        if not effective_control_valid:
+            effective_target_valid = False
+        if item.next_pc is None:
+            entry_node = self.marker_location(UNKNOWN_TARGET)
+        else:
+            entry_node = self.make_entry_node(item, target_hint)
+        continuity = "after_gap" if self.next_token_after_gap else "continuous"
         if self.segment.start is None:
             self.segment.start = self.token_location(start_node)
-            if self.include_module_in_token:
-                self.segment.start["module"] = start_node.get("module") or UNKNOWN
-        token = self.make_structured_token(item, exit_node, entry_node)
+        token = self.make_structured_token(
+            item,
+            start_node,
+            exit_node,
+            entry_node,
+            target_valid=effective_target_valid,
+            target_source=target_source,
+            confidence=effective_confidence,
+            control_valid=effective_control_valid,
+            path_confidence=item.path_confidence,
+            continuity=continuity,
+            reason=reason or item.reason,
+        )
         self.edge_types[control] += 1
         self.stats["output_edges"] += 1
+        if not effective_target_valid:
+            self.stats["output_edges_invalid_target"] += 1
+        if not effective_control_valid:
+            self.stats["output_edges_invalid_control"] += 1
+        if continuity != "continuous":
+            self.stats["output_edges_after_gap"] += 1
         self.segment.edge_count += 1
         self.segment.range_count += 1
         self.global_edge_index += 1
         self.segment_tokens.append(token)
+        self.next_token_after_gap = False
 
     def stats_record(self) -> Dict[str, Any]:
         length_stats: Dict[str, Any]
@@ -796,6 +1177,7 @@ class FlowPreprocessor:
             length_stats = {"count": 0, "total": 0}
 
         return {
+            "recovery_policy": self.recovery_policy,
             "counts": dict(sorted(self.stats.items())),
             "edge_types": dict(sorted(self.edge_types.items())),
             "waypoint_kinds": dict(sorted(self.waypoint_kinds.items())),
@@ -900,7 +1282,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--include-module-in-token",
         action="store_true",
-        help="Include module name in each structured token location. Usually unnecessary for single-ELF training.",
+        help=(
+            "Deprecated compatibility flag. Module identity is now always "
+            "included in every structured token location."
+        ),
+    )
+    parser.add_argument(
+        "--recovery-policy",
+        choices=("evidence", "strict"),
+        default="evidence",
+        help=(
+            "evidence keeps unresolved ranges and soft-gap markers without inventing paths; "
+            "strict retains the legacy fully-continuous behavior. Default: evidence"
+        ),
     )
     return parser
 
@@ -912,6 +1306,7 @@ def process_one_file(
     include_module_in_token: bool,
     min_segment_edges: int,
     target_modules: Optional[Set[str]],
+    recovery_policy: str = "evidence",
 ) -> Dict[str, Any]:
     input_path = Path(input_path_text)
     output_path = Path(output_path_text)
@@ -925,6 +1320,7 @@ def process_one_file(
             include_module_in_token=include_module_in_token,
             target_modules=target_modules,
             min_segment_edges=min_segment_edges,
+            recovery_policy=recovery_policy,
         )
         preprocessor.process_file(input_path)
         stats = preprocessor.stats_record()
@@ -1059,6 +1455,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 include_module_in_token=args.include_module_in_token,
                 min_segment_edges=args.min_segment_edges,
                 target_modules=target_modules,
+                recovery_policy=args.recovery_policy,
             )
             for input_path, output_path in task_args
         ]
@@ -1073,6 +1470,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     include_module_in_token=args.include_module_in_token,
                     min_segment_edges=args.min_segment_edges,
                     target_modules=target_modules,
+                    recovery_policy=args.recovery_policy,
                 )
                 for input_path, output_path in task_args
             ]

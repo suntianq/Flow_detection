@@ -302,7 +302,7 @@ def collect_representative_batches(
         f"(target={sample_limit}, batch={inference_batch_size})..."
     )
     for batch_index in range(len(train_data)):
-        inputs, _ = train_data[batch_index]
+        inputs = train_data[batch_index][0]
         batch_size = len(next(iter(inputs.values())))
         for row in range(0, batch_size, inference_batch_size):
             stop = row + inference_batch_size

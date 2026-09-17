@@ -8,7 +8,7 @@
 
 ### `etm_flow.data`
 
-负责把符号化事件转换为连续控制流片段，并编码成可用于训练的 memmap 数据集。该层可以依赖 NumPy，但不应导入具体模型实现。
+负责把符号化事件转换为带恢复质量标记的控制流片段，并编码成可用于训练的 memmap 数据集。默认 `evidence` 策略保留未知目标、返回栈冲突和软丢包边界；`strict` 只用于复现旧版过滤结果。该层可以依赖 NumPy，但不应导入具体模型实现。
 
 ### `etm_flow.modeling`
 
@@ -33,7 +33,15 @@
 ## 变更原则
 
 1. Trace 格式变化先在 `trace` 层兼容，再更新 `data` 层。
-2. 数据字段变化必须同步更新 `dataset.py`、模型输入和配置说明。
+2. 数据字段变化必须同步更新 `dataset.py`、模型输入和配置说明。恢复质量字段通过辅助 memmap 和 sample weight 进入训练，不能把未知目标当成真实分类标签。
 3. 新模型放在 `modeling/models/`，并在该目录的 `__init__.py` 注册。
 4. 命令行行为变化要更新 README，并为纯函数补充快速测试。
 5. 配置、代码和生成产物分开管理；配置可以提交，运行数据不提交。
+
+## 数据集字段约定
+
+数据集格式版本 4 使用八个因子化输入字段：`src_module`、`src_ctrl_func`、
+`src_ctrl_off`、`ctrl_type`、`dst_module`、`dst_func`、`dst_off` 和 `icount`。
+`dst_node = module::function@offset` 仅作为 `next_dst_node` 的联合分类标签，
+不再作为模型输入。这样既避免重复编码，又保留跨主程序、共享库和动态加载
+模块的控制流身份。

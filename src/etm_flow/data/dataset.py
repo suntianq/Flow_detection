@@ -35,19 +35,42 @@ except Exception:  # pragma: no cover - TensorFlow is only required for training
 PAD_TOKEN = "<PAD>"
 OOV_TOKEN = "<OOV>"
 UNKNOWN_TOKEN = "<unknown>"
+UNKNOWN_MODULE_TOKEN = "<UNKNOWN_MODULE>"
+UNKNOWN_TARGET_TOKEN = "<UNKNOWN_TARGET>"
+GAP_TOKEN = "<GAP>"
+SPECIAL_NODE_TOKENS = (
+    f"{UNKNOWN_TARGET_TOKEN}@0x0",
+    f"{GAP_TOKEN}@0x0",
+)
 PAD_ID = 0
 OOV_ID = 1
 
-STALE_INDEX_FILES = ("examples.dat", "segment_starts.dat", "segment_lengths.dat")
+STALE_INDEX_FILES = (
+    "examples.dat",
+    "segment_starts.dat",
+    "segment_lengths.dat",
+    "entry_func.dat",
+    "entry_off.dat",
+)
 
 INPUT_FIELDS = (
-    "entry_func",
-    "entry_off",
+    "src_module",
     "src_ctrl_func",
     "src_ctrl_off",
     "ctrl_type",
-    "dst_node",
+    "dst_module",
+    "dst_func",
+    "dst_off",
     "icount",
+)
+
+# Per-row metadata used for loss masking and inference reporting.  These fields
+# deliberately stay out of INPUT_FIELDS.
+AUX_FIELDS = (
+    "target_valid",
+    "control_valid",
+    "transition_valid",
+    "is_gap",
 )
 
 TARGET_FIELDS = {
@@ -55,9 +78,17 @@ TARGET_FIELDS = {
     "next_ctrl_type": "ctrl_type",
 }
 
+# Joint destination nodes remain encoded as labels, but are no longer model
+# inputs.  Historical destinations are represented by the factorised
+# dst_module/dst_func/dst_off fields above.
+DATA_FIELDS = INPUT_FIELDS + tuple(
+    field for field in TARGET_FIELDS.values() if field not in INPUT_FIELDS
+)
+
 VOCAB_SOURCE_FIELDS = {
-    "function": ("entry_func", "src_ctrl_func"),
-    "offset": ("entry_off", "src_ctrl_off"),
+    "module": ("src_module", "dst_module"),
+    "function": ("src_ctrl_func", "dst_func"),
+    "offset": ("src_ctrl_off", "dst_off"),
     "node": ("dst_node",),
     "ctrl_type": ("ctrl_type",),
 }
@@ -95,10 +126,15 @@ def instruction_count_id(value: Any, clip: int) -> int:
     return min(parsed, clip) + 2
 
 
-def make_node(function: Optional[str], offset: Optional[str]) -> Optional[str]:
+def make_node(
+    module: Optional[str], function: Optional[str], offset: Optional[str]
+) -> Optional[str]:
     if function is None or offset is None:
         return None
-    return f"{function}@{offset}"
+    if function in {UNKNOWN_TARGET_TOKEN, GAP_TOKEN}:
+        return f"{function}@{offset}"
+    module_name = module or UNKNOWN_MODULE_TOKEN
+    return f"{module_name}::{function}@{offset}"
 
 
 def ctrl_type(kind: Any, atom: Any) -> Optional[str]:
@@ -120,17 +156,19 @@ def ctrl_type(kind: Any, atom: Any) -> Optional[str]:
 
 @dataclass
 class DatasetBuildConfig:
+    max_module_vocab: int = 4096
     max_function_vocab: int = 50000
     max_offset_vocab: int = 65536
     max_node_vocab: int = 200000
     max_ctrl_type_vocab: int = 0
     instruction_count_clip: int = 255
-    min_segment_length: int = 2
+    min_segment_length: int = 1
     recursive: bool = False
     patterns: Tuple[str, ...] = ("*.jsonl",)
 
     def validate(self) -> None:
         vocab_limits = {
+            "max_module_vocab": self.max_module_vocab,
             "max_function_vocab": self.max_function_vocab,
             "max_offset_vocab": self.max_offset_vocab,
             "max_node_vocab": self.max_node_vocab,
@@ -141,8 +179,8 @@ class DatasetBuildConfig:
                 raise ValueError(f"{name} must be 0 (unlimited) or at least 2")
         if self.instruction_count_clip < 0:
             raise ValueError("instruction_count_clip must be >= 0")
-        if self.min_segment_length < 2:
-            raise ValueError("min_segment_length must be >= 2")
+        if self.min_segment_length < 1:
+            raise ValueError("min_segment_length must be >= 1")
         if not self.patterns or any(not pattern.strip() for pattern in self.patterns):
             raise ValueError("patterns must contain at least one non-empty glob")
 
@@ -159,7 +197,17 @@ class FieldVocab:
         }
         self.id_to_token: List[str] = [PAD_TOKEN, OOV_TOKEN]
 
-    def build(self, counter: Counter[str]) -> None:
+    def build(self, counter: Counter[str], *, reserved_tokens: Sequence[str] = ()) -> None:
+        for token in reserved_tokens:
+            if token in self.token_to_id:
+                continue
+            if self.max_size > 0 and len(self.id_to_token) >= self.max_size:
+                raise ValueError(
+                    f"max_size for {self.name} is too small for required token {token!r}"
+                )
+            self.token_to_id[token] = len(self.id_to_token)
+            self.id_to_token.append(token)
+
         if self.max_size > 0:
             limit = self.max_size - len(self.id_to_token)
             items = counter.most_common(limit)
@@ -259,26 +307,53 @@ def iter_segment_edges(record: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     if not isinstance(tokens, list):
         return
 
-    previous_dst = as_dict(record.get("start"))
     for token in tokens:
         if not isinstance(token, dict):
             continue
         src_ctrl = as_dict(token.get("src_ctrl"))
         ctrl = as_dict(token.get("ctrl"))
         dst = as_dict(token.get("dst"))
+        quality = as_dict(token.get("quality"))
+        src_module = location_value(src_ctrl, "module") or UNKNOWN_MODULE_TOKEN
+        dst_module = location_value(dst, "module") or UNKNOWN_MODULE_TOKEN
         dst_func = location_value(dst, "function")
         dst_off = location_value(dst, "function_offset")
+        control = ctrl_type(ctrl.get("kind"), ctrl.get("atom"))
+        confidence = clean_value(quality.get("confidence"))
+        status = clean_value(quality.get("status"))
+        if control is not None and confidence in {"speculative", "unresolved", "conflict"}:
+            control = f"{control}|{confidence}"
+
+        quality_target_valid = quality.get("target_valid")
+        quality_control_valid = quality.get("control_valid")
+        target_valid = (
+            quality_target_valid and dst_func is not None and dst_off is not None
+            if isinstance(quality_target_valid, bool)
+            else dst_func is not None and dst_off is not None
+        )
+        continuity = clean_value(quality.get("continuity")) or "continuous"
+        is_gap = status == "gap" or clean_value(ctrl.get("kind")) == "flow_gap"
+        control_valid = (
+            quality_control_valid
+            if isinstance(quality_control_valid, bool)
+            else clean_value(quality.get("path_confidence")) != "speculative"
+        )
 
         yield {
-            "entry_func": location_value(previous_dst, "function"),
-            "entry_off": location_value(previous_dst, "function_offset"),
+            "src_module": src_module,
             "src_ctrl_func": location_value(src_ctrl, "function"),
             "src_ctrl_off": location_value(src_ctrl, "function_offset"),
-            "ctrl_type": ctrl_type(ctrl.get("kind"), ctrl.get("atom")),
-            "dst_node": make_node(dst_func, dst_off),
+            "ctrl_type": control,
+            "dst_module": dst_module,
+            "dst_func": dst_func,
+            "dst_off": dst_off,
+            "dst_node": make_node(dst_module, dst_func, dst_off),
             "icount_raw": token.get("instruction_count"),
+            "target_valid": int(bool(target_valid)),
+            "control_valid": int(bool(control_valid)),
+            "transition_valid": int(continuity == "continuous"),
+            "is_gap": int(is_gap),
         }
-        previous_dst = dst
 
 
 def scan_sequences(
@@ -293,6 +368,10 @@ def scan_sequences(
         "segments_dropped_short": 0,
         "edges": 0,
         "examples": 0,
+        "invalid_target_edges": 0,
+        "invalid_control_edges": 0,
+        "gap_edges": 0,
+        "invalid_transition_examples": 0,
     }
 
     with tqdm(desc="scan segments", unit="segment") as progress:
@@ -315,6 +394,16 @@ def scan_sequences(
                 stats["segments_kept"] += 1
                 stats["edges"] += len(edges)
                 stats["examples"] += len(edges) - 1
+                stats["invalid_target_edges"] += sum(
+                    1 for edge in edges if not edge["target_valid"]
+                )
+                stats["invalid_control_edges"] += sum(
+                    1 for edge in edges if not edge["control_valid"]
+                )
+                stats["gap_edges"] += sum(1 for edge in edges if edge["is_gap"])
+                stats["invalid_transition_examples"] += sum(
+                    1 for edge in edges[1:] if not edge["transition_valid"]
+                )
                 for edge in edges:
                     for vocab_name, source_fields in VOCAB_SOURCE_FIELDS.items():
                         counters[vocab_name].update(
@@ -326,13 +415,17 @@ def scan_sequences(
 
 def build_vocabs(counters: Dict[str, Counter[str]], config: DatasetBuildConfig) -> Dict[str, FieldVocab]:
     vocabs = {
+        "module": FieldVocab("module", config.max_module_vocab),
         "function": FieldVocab("function", config.max_function_vocab),
         "offset": FieldVocab("offset", config.max_offset_vocab),
         "node": FieldVocab("node", config.max_node_vocab),
         "ctrl_type": FieldVocab("ctrl_type", config.max_ctrl_type_vocab),
     }
     for name, vocab in vocabs.items():
-        vocab.build(counters[name])
+        vocab.build(
+            counters[name],
+            reserved_tokens=SPECIAL_NODE_TOKENS if name == "node" else (),
+        )
     return vocabs
 
 
@@ -367,13 +460,19 @@ def encode_edge(
     config: DatasetBuildConfig,
 ) -> Dict[str, int]:
     return {
-        "entry_func": vocabs["function"].encode(edge.get("entry_func")),
-        "entry_off": vocabs["offset"].encode(edge.get("entry_off")),
+        "src_module": vocabs["module"].encode(edge.get("src_module")),
         "src_ctrl_func": vocabs["function"].encode(edge.get("src_ctrl_func")),
         "src_ctrl_off": vocabs["offset"].encode(edge.get("src_ctrl_off")),
         "ctrl_type": vocabs["ctrl_type"].encode(edge.get("ctrl_type")),
+        "dst_module": vocabs["module"].encode(edge.get("dst_module")),
+        "dst_func": vocabs["function"].encode(edge.get("dst_func")),
+        "dst_off": vocabs["offset"].encode(edge.get("dst_off")),
         "dst_node": vocabs["node"].encode(edge.get("dst_node")),
         "icount": instruction_count_id(edge.get("icount_raw"), config.instruction_count_clip),
+        "target_valid": int(bool(edge.get("target_valid", 1))),
+        "control_valid": int(bool(edge.get("control_valid", 1))),
+        "transition_valid": int(bool(edge.get("transition_valid", 1))),
+        "is_gap": int(bool(edge.get("is_gap", 0))),
     }
 
 
@@ -401,10 +500,21 @@ def encode_sequences(
             mode="w+",
             shape=(total_rows,),
         )
-        for field in INPUT_FIELDS
+        for field in DATA_FIELDS
     }
     for array in field_arrays.values():
         array[:] = PAD_ID
+    aux_arrays = {
+        field: np.memmap(
+            output_dir / f"{field}.dat",
+            dtype="uint8",
+            mode="w+",
+            shape=(total_rows,),
+        )
+        for field in AUX_FIELDS
+    }
+    for array in aux_arrays.values():
+        array[:] = 0
 
     row_ptr = 0
     edge_ptr = 0
@@ -423,8 +533,10 @@ def encode_sequences(
 
                 for local_pos, edge in enumerate(edges):
                     encoded = encode_edge(edge, vocabs, config)
-                    for field in INPUT_FIELDS:
+                    for field in DATA_FIELDS:
                         field_arrays[field][row_ptr + local_pos] = encoded[field]
+                    for field in AUX_FIELDS:
+                        aux_arrays[field][row_ptr + local_pos] = encoded[field]
 
                 row_ptr += len(edges)
                 edge_ptr += len(edges)
@@ -437,6 +549,8 @@ def encode_sequences(
                     )
 
     for array in field_arrays.values():
+        array.flush()
+    for array in aux_arrays.values():
         array.flush()
 
     if row_ptr != total_rows or edge_ptr != total_edges or segment_ptr != total_segments:
@@ -455,11 +569,17 @@ def encode_sequences(
         "total_segments": total_segments,
         "total_examples": total_examples,
         "field_dtype": "uint32",
+        "aux_fields": list(AUX_FIELDS),
+        "aux_dtype": "uint8",
+        "format_version": 4,
+        "node_identity": "module::function@offset",
+        "input_representation": "factorized-source-and-destination",
         "boundary_row": "all input fields are PAD_ID",
         "instruction_count_clip": config.instruction_count_clip,
         "instruction_count_vocab_size": config.instruction_count_clip + 3,
         "min_segment_length": config.min_segment_length,
         "vocab_sizes": {
+            "module": vocabs["module"].size,
             "function": vocabs["function"].size,
             "offset": vocabs["offset"].size,
             "node": vocabs["node"].size,
@@ -522,6 +642,23 @@ def load_vocab_sizes(dataset_dir: Path) -> Dict[str, int]:
     return {key: int(value) for key, value in sizes.items()}
 
 
+def validate_aux_schema(meta: Dict[str, Any]) -> None:
+    if int(meta.get("format_version", 0)) != 4:
+        raise ValueError(
+            "dataset format is obsolete; rerun etm-preprocess and "
+            "etm-build-dataset with the module-aware schema"
+        )
+    if tuple(meta.get("input_fields", ())) != INPUT_FIELDS:
+        raise ValueError("dataset input fields do not match the module-aware model schema")
+    if tuple(meta.get("aux_fields", ())) != AUX_FIELDS:
+        raise ValueError(
+            "dataset does not contain the evidence-quality fields required by "
+            "this version; rerun etm-preprocess and etm-build-dataset"
+        )
+    if str(meta.get("aux_dtype", "")) != "uint8":
+        raise ValueError("dataset aux_dtype must be uint8")
+
+
 class FlowSequence(KerasSequence):
     """Keras generator that samples next-token targets without crossing segments."""
 
@@ -548,6 +685,7 @@ class FlowSequence(KerasSequence):
 
         self.dataset_dir = dataset_dir.expanduser().resolve()
         self.meta = load_meta(self.dataset_dir)
+        validate_aux_schema(self.meta)
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
         self.mode = mode
@@ -564,7 +702,16 @@ class FlowSequence(KerasSequence):
                 mode="r",
                 shape=(total_rows,),
             )
-            for field in INPUT_FIELDS
+            for field in DATA_FIELDS
+        }
+        self.aux = {
+            field: np.memmap(
+                self.dataset_dir / f"{field}.dat",
+                dtype="uint8",
+                mode="r",
+                shape=(total_rows,),
+            )
+            for field in AUX_FIELDS
         }
 
         ctrl_type_values = np.asarray(self.fields["ctrl_type"])
@@ -597,7 +744,9 @@ class FlowSequence(KerasSequence):
         if self.shuffle and len(self.indices) > 1:
             self.rng.shuffle(self.indices)
 
-    def __getitem__(self, batch_index: int) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    def __getitem__(
+        self, batch_index: int
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         if batch_index < 0 or batch_index >= len(self):
             raise IndexError(f"batch index out of range: {batch_index}")
         batch_ids = self.indices[
@@ -610,6 +759,10 @@ class FlowSequence(KerasSequence):
         }
         y = {
             target: np.empty((batch_size,), dtype=np.int32)
+            for target in TARGET_FIELDS
+        }
+        sample_weight = {
+            target: np.empty((batch_size,), dtype=np.float32)
             for target in TARGET_FIELDS
         }
 
@@ -632,27 +785,52 @@ class FlowSequence(KerasSequence):
             for output_name, source_field in TARGET_FIELDS.items():
                 y[output_name][row] = self.fields[source_field][target_abs]
 
-        return x, y
+            transition_valid = float(self.aux["transition_valid"][target_abs])
+            control_valid = float(self.aux["control_valid"][target_abs])
+            sample_weight["next_ctrl_type"][row] = transition_valid * control_valid
+            sample_weight["next_dst_node"][row] = transition_valid * float(
+                self.aux["target_valid"][target_abs]
+            ) * control_valid
+
+        return x, y, sample_weight
 
 
 def dataset_ready(dataset_dir: Path) -> bool:
     dataset_dir = dataset_dir.expanduser()
-    required = ["meta.json", "vocab.json", *(f"{field}.dat" for field in INPUT_FIELDS)]
+    required = [
+        "meta.json",
+        "vocab.json",
+        *(f"{field}.dat" for field in DATA_FIELDS),
+        *(f"{field}.dat" for field in AUX_FIELDS),
+    ]
     if not all((dataset_dir / item).is_file() for item in required):
         return False
     try:
         meta = load_meta(dataset_dir)
         total_rows = int(meta["total_rows"])
         field_dtype = np.dtype(str(meta.get("field_dtype", "uint32")))
-        if total_rows <= 0 or tuple(meta.get("input_fields", ())) != INPUT_FIELDS:
+        if (
+            total_rows <= 0
+            or tuple(meta.get("input_fields", ())) != INPUT_FIELDS
+            or int(meta.get("format_version", 0)) != 4
+        ):
             return False
         if field_dtype != np.dtype("uint32"):
+            return False
+        if tuple(meta.get("aux_fields", ())) != AUX_FIELDS:
+            return False
+        if np.dtype(str(meta.get("aux_dtype", ""))) != np.dtype("uint8"):
             return False
 
         expected_bytes = total_rows * field_dtype.itemsize
         if any(
             (dataset_dir / f"{field}.dat").stat().st_size != expected_bytes
-            for field in INPUT_FIELDS
+            for field in DATA_FIELDS
+        ):
+            return False
+        if any(
+            (dataset_dir / f"{field}.dat").stat().st_size != total_rows
+            for field in AUX_FIELDS
         ):
             return False
 
@@ -680,12 +858,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--glob", dest="patterns", action="append", default=None)
     parser.add_argument("--recursive", action="store_true")
+    parser.add_argument("--max-module-vocab", type=int, default=4096)
     parser.add_argument("--max-function-vocab", type=int, default=50000)
     parser.add_argument("--max-offset-vocab", type=int, default=65536)
     parser.add_argument("--max-node-vocab", type=int, default=200000)
     parser.add_argument("--max-ctrl-type-vocab", type=int, default=0)
     parser.add_argument("--instruction-count-clip", type=int, default=255)
-    parser.add_argument("--min-segment-length", type=int, default=2)
+    parser.add_argument("--min-segment-length", type=int, default=1)
     return parser
 
 
@@ -693,6 +872,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     config = DatasetBuildConfig(
+        max_module_vocab=args.max_module_vocab,
         max_function_vocab=args.max_function_vocab,
         max_offset_vocab=args.max_offset_vocab,
         max_node_vocab=args.max_node_vocab,
